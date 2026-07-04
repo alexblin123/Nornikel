@@ -12,7 +12,7 @@ from streamlit_drawable_canvas import st_canvas
 
 # Импортируем анализатор и утилиту ресайза
 from analyzer import ShlifAnalyzer, resize_if_large
-
+st.write("Streamlit version:", st.__version__)
 analyzer = ShlifAnalyzer()
 
 try:
