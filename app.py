@@ -3,6 +3,7 @@ import cv2
 import json
 import base64
 import datetime
+import tempfile
 from io import BytesIO
 import streamlit as st
 
@@ -131,9 +132,8 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             w_percent = canvas_width / float(orig_w)
             canvas_height = int(orig_h * w_percent)
 
-            bg_img_resized = bg_img.resize(
-                (canvas_width, canvas_height),
-                Image.Resampling.LANCZOS
+            bg_img_resized = np.array(
+                bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
             )
 
             canvas_result = st_canvas(
@@ -217,7 +217,7 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
-    temp_path = "temp_core_analysis.jpg"
+    temp_path = os.path.join(tempfile.gettempdir(), "temp_core_analysis.jpg")
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
