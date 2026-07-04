@@ -1,0 +1,17 @@
+# Игнорировать виртуальное окружение
+.venv/
+venv/
+.env
+
+# Игнорировать системные файлы
+__pycache__/
+.DS_Store
+.idea/
+
+# Игнорировать временные файлы и датасеты
+data/
+active_learning_dataset/
+temp_*.jpg
+nornickel_metrics.csv
+nornickel_passport.pdf
+nornickel_gis_contours.geojson
