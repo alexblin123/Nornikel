@@ -5,6 +5,12 @@ import base64
 import datetime
 from io import BytesIO
 import streamlit as st
+
+st.set_page_config(
+    page_title="НОРНИКЕЛЬ | Автоматизация анализа шлифов",
+    page_icon=None,
+    layout="wide"
+)
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -12,7 +18,7 @@ from streamlit_drawable_canvas import st_canvas
 
 # Импортируем анализатор и утилиту ресайза
 from analyzer import ShlifAnalyzer, resize_if_large
-st.write("Streamlit version:", st.__version__)
+
 analyzer = ShlifAnalyzer()
 
 try:
@@ -21,11 +27,7 @@ except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
 
 # --- НАСТРОЙКА СТРАНИЦЫ ---
-st.set_page_config(
-    page_title="НОРНИКЕЛЬ | Автоматизация анализа шлифов",
-    page_icon=None,
-    layout="wide"
-)
+
 
 # --- ИНЪЕКЦИЯ КОРПОРАТИВНОГО СТИЛЯ ---
 st.markdown("""
