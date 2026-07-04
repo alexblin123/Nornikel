@@ -124,26 +124,36 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             orig_w, orig_h = bg_img.size
 
             base_canvas_width = 750
-
             canvas_width = base_canvas_width
             w_percent = canvas_width / float(orig_w)
             canvas_height = int(orig_h * w_percent)
 
-            bg_img_resized = bg_img.resize(
-                (int(canvas_width), int(canvas_height)),
-                Image.Resampling.LANCZOS
-            ).convert("RGB")
+            # Кодируем фон в base64 и кладём его ПОД холст через CSS
+            buffer = BytesIO()
+            bg_img.resize((canvas_width, canvas_height),
+                          Image.Resampling.LANCZOS).save(buffer, format="PNG")
+            bg_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+            st.markdown(f"""
+                <style>
+                    div[data-testid="stCanvas"] {{
+                        background-image: url("data:image/png;base64,{bg_b64}");
+                        background-size: {canvas_width}px {canvas_height}px;
+                        background-repeat: no-repeat;
+                    }}
+                </style>
+            """, unsafe_allow_html=True)
 
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_image=bg_img_resized,
+                background_image=None,
                 update_streamlit=True,
                 height=canvas_height,
                 width=canvas_width,
                 drawing_mode=actual_mode,
-                key="modal_expert_canvas",
+                key=f"modal_expert_canvas_{original_filename}",
             )
         except Exception as e:
             st.error(f"Ошибка загрузки холста: {e}")
