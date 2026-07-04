@@ -20,17 +20,6 @@ try:
 except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
 
-
-# --- 🚀 КЕШИРОВАНИЕ ДАННЫХ ---
-# Кешируем по байтам картинки, чтобы анализ не перезапускался при кликах на кнопки!
-@st.cache_data
-def cached_analyze(image_bytes):
-    temp_path = "temp_cached_core.jpg"
-    with open(temp_path, "wb") as f:
-        f.write(image_bytes)
-    return analyzer.analyze(temp_path)
-
-
 # --- НАСТРОЙКА СТРАНИЦЫ ---
 st.set_page_config(
     page_title="НОРНИКЕЛЬ | Автоматизация анализа шлифов",
@@ -88,7 +77,7 @@ def mask_to_base64(mask_array):
 
 # --- 🖍️ ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
 @st.experimental_dialog("Режим экспертной разметки (Обучение с подкреплением)")
-def show_markup_modal(image_bytes, original_filename, original_verdict):
+def show_markup_modal(saved_img_path, original_filename, original_verdict):
     modal_left, modal_right = st.columns([1.1, 2.9])
 
     with modal_left:
@@ -130,27 +119,45 @@ def show_markup_modal(image_bytes, original_filename, original_verdict):
 
     with modal_right:
         try:
-            # 🟢 Читаем изображение напрямую из оперативной памяти (решает проблему белого фона в облаке)
-            bg_img = Image.open(BytesIO(image_bytes)).convert("RGB")
+            bg_img = Image.open(saved_img_path).convert("RGB")
             orig_w, orig_h = bg_img.size
 
-            canvas_width = 750
+            base_canvas_width = 750
+            canvas_width = base_canvas_width
             w_percent = canvas_width / float(orig_w)
             canvas_height = int(orig_h * w_percent)
 
-            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+            buffer = BytesIO()
+            bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS).save(buffer, format="PNG")
+            bg_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-            # 🟢 Передаем готовый PIL Image прямо в параметр (без CSS)
+            st.markdown(f"""
+                <style>
+                    /* 🟢 1. ДЕЛАЕМ ПЕСОЧНИЦУ ХОЛСТА ПРОЗРАЧНОЙ */
+                    div[data-testid="stCanvas"] iframe {{
+                        background-color: transparent !important;
+                    }}
+                    /* 2. ТВОЙ КОД: КЛАДЕМ КАРТИНКУ ПОД ХОЛСТ */
+                    div[data-testid="stCanvas"] {{
+                        background-image: url("data:image/png;base64,{bg_b64}");
+                        background-size: {canvas_width}px {canvas_height}px;
+                        background-repeat: no-repeat;
+                        background-position: top left;
+                    }}
+                </style>
+            """, unsafe_allow_html=True)
+
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_image=bg_img_resized,
+                background_color="rgba(0, 0, 0, 0)",  # 🟢 3. ГАШИМ СЕРЫЙ ФОН ПЛАГИНА!
+                background_image=None,  # Оставляем None, чтобы избежать бага массивов
                 update_streamlit=True,
                 height=canvas_height,
                 width=canvas_width,
                 drawing_mode=actual_mode,
-                key="modal_expert_canvas",
+                key=f"modal_expert_canvas_{original_filename}",
             )
         except Exception as e:
             st.error(f"Ошибка загрузки холста: {e}")
@@ -166,15 +173,15 @@ def show_markup_modal(image_bytes, original_filename, original_verdict):
             mask_talc = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
 
             green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (
-                    drawn_rgba[:, :, 3] > 0)
+                        drawn_rgba[:, :, 3] > 0)
             mask_ordinary[green_pixels] = 255
 
             red_pixels = (drawn_rgba[:, :, 0] > 150) & (drawn_rgba[:, :, 1] < 100) & (drawn_rgba[:, :, 2] < 100) & (
-                    drawn_rgba[:, :, 3] > 0)
+                        drawn_rgba[:, :, 3] > 0)
             mask_thin[red_pixels] = 255
 
             blue_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 50) & (drawn_rgba[:, :, 2] > 150) & (
-                    drawn_rgba[:, :, 3] > 0)
+                        drawn_rgba[:, :, 3] > 0)
             mask_talc[blue_pixels] = 255
 
             mask_ordinary_orig = cv2.resize(mask_ordinary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -223,17 +230,12 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
-    # Сохраняем байты в память, чтобы они не зависели от диска
-    image_bytes = uploaded_file.getvalue()
-
-    # Для совместимости с cv2 сохраняем временный файл
     temp_path = "temp_core_analysis.jpg"
     with open(temp_path, "wb") as f:
-        f.write(image_bytes)
+        f.write(uploaded_file.getbuffer())
 
     with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
-        # Передаем байты в кеш (работает в 10 раз стабильнее)
-        result = cached_analyze(image_bytes)
+        result = analyzer.analyze(temp_path)
         result["original_image_path"] = temp_path
 
         if "metrics" in result:
@@ -243,7 +245,7 @@ if uploaded_file is not None:
     verdict = result["verdict"]
     if verdict == "Оталькованная":
         status_badge = '<span style="color: #0080C8; font-weight: bold;">🔵 Оталькованная руда</span>'
-    elif verdict == "Рядовой" or verdict == "Рядовая":
+    elif verdict == "Рядовой":
         status_badge = '<span style="color: #28A745; font-weight: bold;">🟢 Рядовая руда</span>'
     else:
         status_badge = '<span style="color: #DC3545; font-weight: bold;">🔴 Труднообогатимая руда</span>'
@@ -296,8 +298,7 @@ if uploaded_file is not None:
         """, unsafe_allow_html=True)
 
         if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True):
-            # 🟢 Передаем байты (надежно), а не путь к временному файлу!
-            show_markup_modal(image_bytes, uploaded_file.name, verdict)
+            show_markup_modal(temp_path, uploaded_file.name, verdict)
 
     st.divider()
 
