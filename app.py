@@ -10,7 +10,7 @@ import pandas as pd
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-# Импортируем анализатор и утилиту ресайза
+# Извлекаем анализатор
 from analyzer import ShlifAnalyzer, resize_if_large
 
 analyzer = ShlifAnalyzer()
@@ -21,10 +21,25 @@ except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
 
 
-# --- 🚀 КЕШИРОВАНИЕ ДАННЫХ (Убирает зависания) ---
+# --- 🚀 КЕШИРОВАНИЕ ДАННЫХ АНАЛИЗАТОРА ---
 @st.cache_data
 def cached_analyze(temp_path):
     return analyzer.analyze(temp_path)
+
+
+# --- 🖍️ КЕШИРОВАНИЕ РЕСУРСА ДЛЯ СТАБИЛИЗАЦИИ ПОДЛОЖКИ ХОЛСТА (РЕШАЕТ ПРОБЛЕМУ БЕЛОГО ЭКРАНА) ---
+@st.cache_resource
+def load_canvas_bg(img_path, filename, session_token, target_width=750):
+    try:
+        img = Image.open(img_path).convert("RGB")
+        w, h = img.size
+        scale = target_width / float(w)
+        c_width = target_width
+        c_height = int(float(h) * scale)
+        img_resized = img.resize((c_width, c_height), Image.Resampling.LANCZOS)
+        return img_resized, c_width, c_height
+    except Exception as e:
+        return None, 0, 0
 
 
 # --- НАСТРОЙКА СТРАНИЦЫ ---
@@ -79,7 +94,7 @@ st.markdown('<div class="brand-subtitle">Цифровая лаборатория
             unsafe_allow_html=True)
 st.divider()
 
-# --- REЖИМ 1: ЭКРАН ЭКСПЕРТНОЙ РАЗМЕТКИ (ФИКС ОШИБКИ БЕЛОГО ЭКРАНА) ---
+# --- REЖИМ 1: ЭКРАН ЭКСПЕРТНОЙ РАЗМЕТКИ ---
 if st.session_state.show_markup:
     st.markdown("#### 🖍️ Модуль ручной коррекции фаз (Active Learning)")
     st.markdown("Скорректируйте границы фаз. Данные автоматически экспортируются в JSON-пакет по регламенту Норникеля.")
@@ -130,29 +145,31 @@ if st.session_state.show_markup:
 
     with modal_right:
         try:
-            # 🟢 ИСПРАВЛЕНИЕ: Пересоздаем PIL Image из файла на каждый реран.
-            # Это дает React новый хэш объекта и заставляет фоновую подложку отрисовываться намертво!
-            bg_img = Image.open("temp_core_analysis.jpg").convert("RGB")
-            orig_w, orig_h = bg_img.size
-
-            canvas_width = 750
-            w_percent = (canvas_width / float(orig_w))
-            canvas_height = int(float(orig_h) * w_percent)
-
-            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
-
-            canvas_result = st_canvas(
-                fill_color="rgba(0, 0, 0, 0)",
-                stroke_width=brush_size,
-                stroke_color=stroke_color,
-                background_image=bg_img_resized,  # Свежая ссылка решает проблему белого экрана
-                update_streamlit=True,
-                height=canvas_height,
-                width=canvas_width,
-                drawing_mode=actual_mode,
-                key=f"canvas_render_{st.session_state.markup_filename}"
-                # Динамический ключ сбрасывает залипание компонента
+            # 🟢 ИСПРАВЛЕНИЕ БАГА: Вызываем кэшированный загрузчик подложки холста.
+            # Токен времени гарантирует уникальность сессии, но внутри сессии объект Image НЕ пересоздается.
+            bg_img_resized, canvas_width, canvas_height = load_canvas_bg(
+                "temp_core_analysis.jpg",
+                st.session_state.markup_filename,
+                st.session_state.get("markup_time", ""),
+                750
             )
+
+            if bg_img_resized is not None:
+                canvas_result = st_canvas(
+                    fill_color="rgba(0, 0, 0, 0)",
+                    stroke_width=brush_size,
+                    stroke_color=stroke_color,
+                    background_image=bg_img_resized,
+                    update_streamlit=True,
+                    height=canvas_height,
+                    width=canvas_width,
+                    drawing_mode=actual_mode,
+                    key=f"canvas_{st.session_state.markup_filename}"
+                    # Стабильный ключ предотвращает конфликты рендеринга массивов
+                )
+            else:
+                st.error("Не удалось загрузить фоновое изображение.")
+                canvas_result = None
         except Exception as e:
             st.error(f"Ошибка инициализации рабочей области: {e}")
             canvas_result = None
@@ -167,18 +184,17 @@ if st.session_state.show_markup:
             mask_talc = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
 
             green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (
-                        drawn_rgba[:, :, 3] > 0)
+                    drawn_rgba[:, :, 3] > 0)
             mask_ordinary[green_pixels] = 255
 
             red_pixels = (drawn_rgba[:, :, 0] > 150) & (drawn_rgba[:, :, 1] < 100) & (drawn_rgba[:, :, 2] < 100) & (
-                        drawn_rgba[:, :, 3] > 0)
+                    drawn_rgba[:, :, 3] > 0)
             mask_thin[red_pixels] = 255
 
             blue_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 50) & (drawn_rgba[:, :, 2] > 150) & (
-                        drawn_rgba[:, :, 3] > 0)
+                    drawn_rgba[:, :, 3] > 0)
             mask_talc[blue_pixels] = 255
 
-            # Восстанавливаем оригинальные размеры из сохраненного состояния сессии
             orig_w, orig_h = st.session_state.orig_w, st.session_state.orig_h
             mask_ordinary_orig = cv2.resize(mask_ordinary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
             mask_thin_orig = cv2.resize(mask_thin, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -296,6 +312,9 @@ else:
 
                 st.session_state.markup_filename = uploaded_file.name
                 st.session_state.current_verdict = verdict
+
+                # Фиксируем токен времени для текущей сессии разметки
+                st.session_state.markup_time = datetime.datetime.now().isoformat()
                 st.session_state.show_markup = True
                 st.rerun()
 
