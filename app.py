@@ -119,45 +119,27 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
 
     with modal_right:
         try:
+            # Читаем исходное фото с диска и подгоняем размер под экран
             bg_img = Image.open(saved_img_path).convert("RGB")
             orig_w, orig_h = bg_img.size
 
-            base_canvas_width = 750
-            canvas_width = base_canvas_width
+            canvas_width = 750
             w_percent = canvas_width / float(orig_w)
             canvas_height = int(orig_h * w_percent)
 
-            buffer = BytesIO()
-            bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS).save(buffer, format="PNG")
-            bg_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
 
-            st.markdown(f"""
-                <style>
-                    /* 🟢 1. ДЕЛАЕМ ПЕСОЧНИЦУ ХОЛСТА ПРОЗРАЧНОЙ */
-                    div[data-testid="stCanvas"] iframe {{
-                        background-color: transparent !important;
-                    }}
-                    /* 2. ТВОЙ КОД: КЛАДЕМ КАРТИНКУ ПОД ХОЛСТ */
-                    div[data-testid="stCanvas"] {{
-                        background-image: url("data:image/png;base64,{bg_b64}");
-                        background-size: {canvas_width}px {canvas_height}px;
-                        background-repeat: no-repeat;
-                        background-position: top left;
-                    }}
-                </style>
-            """, unsafe_allow_html=True)
-
+            # Напрямую отдаем картинку в холст (в Streamlit 1.35.0 это работает безотказно)
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_color="rgba(0, 0, 0, 0)",  # 🟢 3. ГАШИМ СЕРЫЙ ФОН ПЛАГИНА!
-                background_image=None,  # Оставляем None, чтобы избежать бага массивов
+                background_image=bg_img_resized,
                 update_streamlit=True,
                 height=canvas_height,
                 width=canvas_width,
                 drawing_mode=actual_mode,
-                key=f"modal_expert_canvas_{original_filename}",
+                key=f"expert_canvas_{original_filename}",
             )
         except Exception as e:
             st.error(f"Ошибка загрузки холста: {e}")
@@ -213,7 +195,6 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_talc_{original_filename}.png"), mask_talc_orig)
 
             st.success("✅ Экспорт завершен! Пакет сохранен в папку `active_learning_dataset/`.")
-            st.rerun()
         else:
             st.warning("Нанесите разметку перед отправкой.")
 
