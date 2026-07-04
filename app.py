@@ -10,7 +10,7 @@ import pandas as pd
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-# Импортируем анализатор
+# Импортируем анализатор и утилиту ресайза
 from analyzer import ShlifAnalyzer, resize_if_large
 
 analyzer = ShlifAnalyzer()
@@ -21,24 +21,14 @@ except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
 
 
-# --- 🚀 КЕШИРОВАНИЕ ДАННЫХ АНАЛИЗА ---
+# --- 🚀 КЕШИРОВАНИЕ ДАННЫХ ---
+# Кешируем по байтам картинки, чтобы анализ не перезапускался при кликах на кнопки!
 @st.cache_data
-def cached_analyze(temp_path):
+def cached_analyze(image_bytes):
+    temp_path = "temp_cached_core.jpg"
+    with open(temp_path, "wb") as f:
+        f.write(image_bytes)
     return analyzer.analyze(temp_path)
-
-
-# --- 🖍️ КЕШИРОВАНИЕ ПОДЛОЖКИ ХОЛСТА (Убирает белый экран и ошибки массивов) ---
-@st.cache_resource
-def get_clean_canvas_bg(img_path, target_width=750):
-    try:
-        img = Image.open(img_path).convert("RGB")
-        orig_w, orig_h = img.size
-        w_percent = target_width / float(orig_w)
-        canvas_height = int(orig_h * w_percent)
-        resized_img = img.resize((target_width, canvas_height), Image.Resampling.LANCZOS)
-        return resized_img, target_width, canvas_height
-    except Exception as e:
-        return None, 750, 500
 
 
 # --- НАСТРОЙКА СТРАНИЦЫ ---
@@ -55,7 +45,7 @@ st.markdown("""
         [data-testid="stHeader"] { display: none !important; }
         .stMarkdown, p, label, h3, h5, span, th, td, div { color: #2A2A2A !important; }
 
-        .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 2px; margin-top: -10px; }
+        .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 0px; margin-top: -30px; }
         .brand-subtitle { color: #7F8C8D !important; font-size: 13px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
 
         .stAlert { border-left: 5px solid #0080C8 !important; background-color: #F4F9FC !important; padding: 0.5rem !important; }
@@ -98,7 +88,7 @@ def mask_to_base64(mask_array):
 
 # --- 🖍️ ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
 @st.experimental_dialog("Режим экспертной разметки (Обучение с подкреплением)")
-def show_markup_modal(saved_img_path, original_filename, original_verdict):
+def show_markup_modal(image_bytes, original_filename, original_verdict):
     modal_left, modal_right = st.columns([1.1, 2.9])
 
     with modal_left:
@@ -139,27 +129,31 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
     actual_mode = "freedraw" if drawing_mode == "Кисть" else "polygon"
 
     with modal_right:
-        # 🟢 НА ТИВНАЯ ЗАГРУЗКА: Получаем стабильный закешированный PIL-объект подложки
-        bg_img_resized, canvas_width, canvas_height = get_clean_canvas_bg(saved_img_path, 750)
+        try:
+            # 🟢 Читаем изображение напрямую из оперативной памяти (решает проблему белого фона в облаке)
+            bg_img = Image.open(BytesIO(image_bytes)).convert("RGB")
+            orig_w, orig_h = bg_img.size
 
-        # Читаем размеры оригинала для последующего ресайза масок
-        orig_img_full = Image.open(saved_img_path)
-        orig_w, orig_h = orig_full_size = orig_img_full.size
+            canvas_width = 750
+            w_percent = canvas_width / float(orig_w)
+            canvas_height = int(orig_h * w_percent)
 
-        if bg_img_resized is not None:
+            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+
+            # 🟢 Передаем готовый PIL Image прямо в параметр (без CSS)
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_image=bg_img_resized,  # Передаем картинку прямо в компонент холста
+                background_image=bg_img_resized,
                 update_streamlit=True,
                 height=canvas_height,
                 width=canvas_width,
                 drawing_mode=actual_mode,
-                key=f"canvas_stable_{original_filename}",  # Статический контролируемый ключ
+                key="modal_expert_canvas",
             )
-        else:
-            st.error("Не удалось сформировать подложку для графического редактора.")
+        except Exception as e:
+            st.error(f"Ошибка загрузки холста: {e}")
             canvas_result = None
 
     # --- СОХРАНЕНИЕ JSON ---
@@ -212,6 +206,7 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_talc_{original_filename}.png"), mask_talc_orig)
 
             st.success("✅ Экспорт завершен! Пакет сохранен в папку `active_learning_dataset/`.")
+            st.rerun()
         else:
             st.warning("Нанесите разметку перед отправкой.")
 
@@ -228,12 +223,17 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
+    # Сохраняем байты в память, чтобы они не зависели от диска
+    image_bytes = uploaded_file.getvalue()
+
+    # Для совместимости с cv2 сохраняем временный файл
     temp_path = "temp_core_analysis.jpg"
     with open(temp_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        f.write(image_bytes)
 
     with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
-        result = cached_analyze(temp_path)
+        # Передаем байты в кеш (работает в 10 раз стабильнее)
+        result = cached_analyze(image_bytes)
         result["original_image_path"] = temp_path
 
         if "metrics" in result:
@@ -243,7 +243,7 @@ if uploaded_file is not None:
     verdict = result["verdict"]
     if verdict == "Оталькованная":
         status_badge = '<span style="color: #0080C8; font-weight: bold;">🔵 Оталькованная руда</span>'
-    elif verdict == "Рядовой":
+    elif verdict == "Рядовой" or verdict == "Рядовая":
         status_badge = '<span style="color: #28A745; font-weight: bold;">🟢 Рядовая руда</span>'
     else:
         status_badge = '<span style="color: #DC3545; font-weight: bold;">🔴 Труднообогатимая руда</span>'
@@ -296,7 +296,8 @@ if uploaded_file is not None:
         """, unsafe_allow_html=True)
 
         if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True):
-            show_markup_modal(temp_path, uploaded_file.name, verdict)
+            # 🟢 Передаем байты (надежно), а не путь к временному файлу!
+            show_markup_modal(image_bytes, uploaded_file.name, verdict)
 
     st.divider()
 
