@@ -79,7 +79,7 @@ st.markdown('<div class="brand-subtitle">Цифровая лаборатория
             unsafe_allow_html=True)
 st.divider()
 
-# --- РЕЖИМ 1: АКТИВНЫЙ ЭКРАН ЭКСПЕРТНОЙ РАЗМЕТКИ ---
+# --- РЕЖИМ 1: ЭКРАН ЭКСПЕРТНОЙ РАЗМЕТКИ (БЕЗ ДИАЛОГОВ И БЕЛЫХ ЭКРАНОВ) ---
 if st.session_state.show_markup:
     st.markdown("#### 🖍️ Модуль ручной коррекции фаз (Active Learning)")
     st.markdown("Скорректируйте границы фаз. Данные автоматически экспортируются в JSON-пакет по регламенту Норникеля.")
@@ -130,24 +130,15 @@ if st.session_state.show_markup:
 
     with modal_right:
         try:
-            bg_img = Image.open(st.session_state.markup_img_path).convert("RGB")
-            orig_w, orig_h = bg_img.size
-
-            # Идеальный фиксированный размер без пустых полей справа
-            canvas_width = 750
-            w_percent = (canvas_width / float(orig_w))
-            canvas_height = int(float(orig_h) * w_percent)
-
-            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
-
+            # 🟢 ВМЕСТО ЧТЕНИЯ С ДИСКА КАЖДЫЙ РАЗ — БЕРЕМ СТАБИЛЬНЫЙ КЭШИРОВАННЫЙ ОБЪЕКТ ИЗ СЕССИИ
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_image=bg_img_resized,
+                background_image=st.session_state.markup_bg_image,
                 update_streamlit=True,
-                height=canvas_height,
-                width=canvas_width,
+                height=st.session_state.canvas_height,
+                width=st.session_state.canvas_width,
                 drawing_mode=actual_mode,
                 key="main_expert_canvas"
             )
@@ -159,10 +150,11 @@ if st.session_state.show_markup:
     if submit_clicked and canvas_result is not None:
         if canvas_result.image_data is not None:
             drawn_rgba = canvas_result.image_data
+            c_height, c_width = st.session_state.canvas_height, st.session_state.canvas_width
 
-            mask_ordinary = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
-            mask_thin = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
-            mask_talc = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+            mask_ordinary = np.zeros((c_height, c_width), dtype=np.uint8)
+            mask_thin = np.zeros((c_height, c_width), dtype=np.uint8)
+            mask_talc = np.zeros((c_height, c_width), dtype=np.uint8)
 
             green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (
                     drawn_rgba[:, :, 3] > 0)
@@ -176,6 +168,8 @@ if st.session_state.show_markup:
                     drawn_rgba[:, :, 3] > 0)
             mask_talc[blue_pixels] = 255
 
+            # Восстанавливаем оригинальные размеры из сохраненного состояния сессии
+            orig_w, orig_h = st.session_state.orig_w, st.session_state.orig_h
             mask_ordinary_orig = cv2.resize(mask_ordinary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
             mask_thin_orig = cv2.resize(mask_thin, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
             mask_talc_orig = cv2.resize(mask_talc, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -224,7 +218,7 @@ else:
             f.write(uploaded_file.getbuffer())
 
         with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
-            result = cached_analyze(temp_path)
+            result = result = cached_analyze(temp_path)
             result["original_image_path"] = temp_path
 
             if "metrics" in result:
@@ -248,7 +242,6 @@ else:
         orig_resized = resize_if_large(orig_bgr, 1500)
         overlay_bgr = result["overlay_image"]
 
-        # Оптимальные пропорции: уменьшили картинку слева, дали больше места под легенду и кнопки
         main_col1, main_col2 = st.columns([1.2, 1.8])
 
         with main_col2:
@@ -287,11 +280,24 @@ else:
             </div>
             """, unsafe_allow_html=True)
 
-            # Безопасное переключение в изолированный режим разметки без диалогов
+            # 🟢 ЗДЕСЬ МЫ ГОТОВИМ И ПРЕД-РАСЧИТЫВАЕМ КАРТИНКУ ХОЛСТА ВСЕГО ОДИН РАЗ
             if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True):
-                st.session_state.markup_img_path = temp_path
+                bg_img = Image.open(temp_path).convert("RGB")
+                st.session_state.orig_w, st.session_state.orig_h = bg_img.size
+
+                # Фиксируем размер разметки
+                canvas_width = 750
+                w_percent = (canvas_width / float(st.session_state.orig_w))
+                canvas_height = int(float(st.session_state.orig_h) * w_percent)
+
+                # Записываем в стейт сессии КЭШИРОВАННЫЙ PIL-объект, чтобы он не пересоздавался
+                st.session_state.markup_bg_image = bg_img.resize((canvas_width, canvas_height),
+                                                                 Image.Resampling.LANCZOS)
+                st.session_state.canvas_width = canvas_width
+                st.session_state.canvas_height = canvas_height
                 st.session_state.markup_filename = uploaded_file.name
                 st.session_state.current_verdict = verdict
+
                 st.session_state.show_markup = True
                 st.rerun()
 
@@ -323,7 +329,6 @@ else:
         st.markdown("##### Формирование отчетных документов")
         btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-        # 🟢 ПОЛНОЕ УСТРАНЕНИЕ ПЕРЕЗАГРУЗОК СТРАНИЦЫ ЗА СЧЕТ ИСПОЛЬЗОВАНИЯ В ПАМЯТИ И КЭША
         with btn_col1:
             if export_csv:
                 csv_buffer = BytesIO()
@@ -360,7 +365,3 @@ else:
     else:
         st.info(
             "Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
-
-st.markdown(
-    '<div class="brand-footer">ПАО ГМК «Норильский никель» © 2026. Разработано в рамках хакатона автоматизации анализа шлифов.</div>',
-    unsafe_allow_html=True)
