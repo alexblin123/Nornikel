@@ -10,7 +10,7 @@ import pandas as pd
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-# Извлекаем анализатор
+# Импортируем анализатор и утилиту ресайза
 from analyzer import ShlifAnalyzer, resize_if_large
 
 analyzer = ShlifAnalyzer()
@@ -19,28 +19,6 @@ try:
     from report import export_csv, export_pdf, export_geojson
 except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
-
-
-# --- 🚀 КЕШИРОВАНИЕ ДАННЫХ АНАЛИЗАТОРА ---
-@st.cache_data
-def cached_analyze(temp_path):
-    return analyzer.analyze(temp_path)
-
-
-# --- 🖍️ КЕШИРОВАНИЕ РЕСУРСА ДЛЯ СТАБИЛИЗАЦИИ ПОДЛОЖКИ ХОЛСТА (РЕШАЕТ ПРОБЛЕМУ БЕЛОГО ЭКРАНА) ---
-@st.cache_resource
-def load_canvas_bg(img_path, filename, session_token, target_width=750):
-    try:
-        img = Image.open(img_path).convert("RGB")
-        w, h = img.size
-        scale = target_width / float(w)
-        c_width = target_width
-        c_height = int(float(h) * scale)
-        img_resized = img.resize((c_width, c_height), Image.Resampling.LANCZOS)
-        return img_resized, c_width, c_height
-    except Exception as e:
-        return None, 0, 0
-
 
 # --- НАСТРОЙКА СТРАНИЦЫ ---
 st.set_page_config(
@@ -56,7 +34,7 @@ st.markdown("""
         [data-testid="stHeader"] { display: none !important; }
         .stMarkdown, p, label, h3, h5, span, th, td, div { color: #2A2A2A !important; }
 
-        .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 2px; margin-top: -10px; }
+        .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 0px; margin-top: -30px; }
         .brand-subtitle { color: #7F8C8D !important; font-size: 13px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
 
         .stAlert { border-left: 5px solid #0080C8 !important; background-color: #F4F9FC !important; padding: 0.5rem !important; }
@@ -69,6 +47,19 @@ st.markdown("""
 
         button[title="View fullscreen"] { display: none !important; }
         [data-testid="stImageHoverButtons"] { display: none !important; visibility: hidden !important; }
+
+        /* Расширяем модальное окно на 95% ширины экрана */
+        div[role="dialog"] {
+            width: 95vw !important;
+            max-width: 1350px !important;
+            padding: 1rem !important;
+            border-radius: 8px !important;
+        }
+        div[data-testid="stDialog"] {
+            width: 95vw !important;
+            max-width: 1350px !important;
+            gap: 0.5rem !important;
+        }
 
         .stRadio { margin-bottom: -10px !important; }
         .stSlider { margin-bottom: -10px !important; }
@@ -84,30 +75,18 @@ def mask_to_base64(mask_array):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-# --- ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ПЕРЕКЛЮЧЕНИЯ СТРАНИЦ ---
-if "show_markup" not in st.session_state:
-    st.session_state.show_markup = False
-
-# --- ШАПКА ПЛАТФОРМЫ ---
-st.markdown('<div class="brand-header">НОРНИКЕЛЬ</div>', unsafe_allow_html=True)
-st.markdown('<div class="brand-subtitle">Цифровая лаборатория обогащения | Автоклассификация руд</div>',
-            unsafe_allow_html=True)
-st.divider()
-
-# --- REЖИМ 1: ЭКРАН ЭКСПЕРТНОЙ РАЗМЕТКИ ---
-if st.session_state.show_markup:
-    st.markdown("#### 🖍️ Модуль ручной коррекции фаз (Active Learning)")
-    st.markdown("Скорректируйте границы фаз. Данные автоматически экспортируются в JSON-пакет по регламенту Норникеля.")
-    st.divider()
-
-    modal_left, modal_right = st.columns([1, 2.8])
+# --- 🖍️ ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
+@st.experimental_dialog("Режим экспертной разметки (Обучение с подкреплением)")
+def show_markup_modal(saved_img_path, original_filename, original_verdict):
+    modal_left, modal_right = st.columns([1.1, 2.9])
 
     with modal_left:
         st.markdown("<div style='font-weight: 600; font-size: 14px;'>Инструмент рисования:</div>",
                     unsafe_allow_html=True)
         drawing_mode = st.radio("Инструмент:", ("Кисть", "Полигон"), horizontal=True, label_visibility="collapsed")
 
-        st.markdown("<div style='font-weight: 600; font-size: 14px; margin-top: 15px;'>Размер кисти (1-10):</div>",
+        # Исправленный размер кисти от 1 до 10
+        st.markdown("<div style='font-weight: 600; font-size: 14px; margin-top: 5px;'>Размер кисти:</div>",
                     unsafe_allow_html=True)
         brush_size = st.slider("Размер кисти:", min_value=1, max_value=10, value=3, label_visibility="collapsed")
 
@@ -130,51 +109,47 @@ if st.session_state.show_markup:
         corrected_verdict = st.selectbox(
             "Verdict",
             ["Оталькованная", "Рядовой", "Труднообогатимая"],
-            index=["Оталькованная", "Рядовой", "Труднообогатимая"].index(st.session_state.current_verdict),
+            index=["Оталькованная", "Рядовой", "Труднообогатимая"].index(original_verdict),
             label_visibility="collapsed"
         )
 
         st.markdown("<br><br>", unsafe_allow_html=True)
-        submit_clicked = st.button("💾 Зафиксировать разметку и выйти", use_container_width=True)
-
-        if st.button("❌ Отмена", use_container_width=True):
-            st.session_state.show_markup = False
-            st.rerun()
+        submit_clicked = st.button("💾 Зафиксировать и отправить в ML", use_container_width=True)
 
     actual_mode = "freedraw" if drawing_mode == "Кисть" else "polygon"
 
     with modal_right:
         try:
-            # 🟢 ИСПРАВЛЕНИЕ БАГА: Вызываем кэшированный загрузчик подложки холста.
-            # Токен времени гарантирует уникальность сессии, но внутри сессии объект Image НЕ пересоздается.
-            bg_img_resized, canvas_width, canvas_height = load_canvas_bg(
-                "temp_core_analysis.jpg",
-                st.session_state.markup_filename,
-                st.session_state.get("markup_time", ""),
-                750
+            bg_img = Image.open(saved_img_path).convert("RGB")
+            orig_w, orig_h = bg_img.size
+
+            base_canvas_width = 750
+
+            canvas_width = base_canvas_width
+            w_percent = canvas_width / float(orig_w)
+            canvas_height = int(orig_h * w_percent)
+
+            bg_img_resized = bg_img.resize(
+                (canvas_width, canvas_height),
+                Image.Resampling.LANCZOS
             )
 
-            if bg_img_resized is not None:
-                canvas_result = st_canvas(
-                    fill_color="rgba(0, 0, 0, 0)",
-                    stroke_width=brush_size,
-                    stroke_color=stroke_color,
-                    background_image=bg_img_resized,
-                    update_streamlit=True,
-                    height=canvas_height,
-                    width=canvas_width,
-                    drawing_mode=actual_mode,
-                    key=f"canvas_{st.session_state.markup_filename}"
-                    # Стабильный ключ предотвращает конфликты рендеринга массивов
-                )
-            else:
-                st.error("Не удалось загрузить фоновое изображение.")
-                canvas_result = None
+            canvas_result = st_canvas(
+                fill_color="rgba(0, 0, 0, 0)",
+                stroke_width=brush_size,
+                stroke_color=stroke_color,
+                background_image=bg_img_resized,
+                update_streamlit=True,
+                height=canvas_height,
+                width=canvas_width,
+                drawing_mode=actual_mode,
+                key="modal_expert_canvas",
+            )
         except Exception as e:
-            st.error(f"Ошибка инициализации рабочей области: {e}")
+            st.error(f"Ошибка загрузки холста: {e}")
             canvas_result = None
 
-    # --- ОБРАБОТКА И ЭКСПОРТ РАЗМЕТКИ В JSON ---
+    # --- СОХРАНЕНИЕ JSON ---
     if submit_clicked and canvas_result is not None:
         if canvas_result.image_data is not None:
             drawn_rgba = canvas_result.image_data
@@ -195,13 +170,12 @@ if st.session_state.show_markup:
                     drawn_rgba[:, :, 3] > 0)
             mask_talc[blue_pixels] = 255
 
-            orig_w, orig_h = st.session_state.orig_w, st.session_state.orig_h
             mask_ordinary_orig = cv2.resize(mask_ordinary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
             mask_thin_orig = cv2.resize(mask_thin, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
             mask_talc_orig = cv2.resize(mask_talc, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
             export_payload = {
-                "image_id": st.session_state.markup_filename,
+                "image_id": original_filename,
                 "image_size": {"width": orig_w, "height": orig_h},
                 "user_id": "geolog_ivanov",
                 "timestamp": datetime.datetime.now().isoformat(),
@@ -210,178 +184,163 @@ if st.session_state.show_markup:
                     "thin": mask_to_base64(mask_thin_orig),
                     "ordinary": mask_to_base64(mask_ordinary_orig)
                 },
-                "original_verdict": st.session_state.current_verdict,
+                "original_verdict": original_verdict,
                 "corrected_verdict": corrected_verdict
             }
 
             os.makedirs("active_learning_dataset", exist_ok=True)
-            json_path = os.path.join("active_learning_dataset", f"markup_{st.session_state.markup_filename}.json")
+            json_path = os.path.join("active_learning_dataset", f"markup_{original_filename}.json")
             with open(json_path, "w", encoding="utf-8") as jf:
                 json.dump(export_payload, jf, indent=4, ensure_ascii=False)
 
-            cv2.imwrite(
-                os.path.join("active_learning_dataset", f"mask_ordinary_{st.session_state.markup_filename}.png"),
-                mask_ordinary_orig)
-            cv2.imwrite(os.path.join("active_learning_dataset", f"mask_thin_{st.session_state.markup_filename}.png"),
-                        mask_thin_orig)
-            cv2.imwrite(os.path.join("active_learning_dataset", f"mask_talc_{st.session_state.markup_filename}.png"),
-                        mask_talc_orig)
+            cv2.imwrite(os.path.join("active_learning_dataset", f"mask_ordinary_{original_filename}.png"),
+                        mask_ordinary_orig)
+            cv2.imwrite(os.path.join("active_learning_dataset", f"mask_thin_{original_filename}.png"), mask_thin_orig)
+            cv2.imwrite(os.path.join("active_learning_dataset", f"mask_talc_{original_filename}.png"), mask_talc_orig)
 
-            st.success("✅ Экспорт завершен! Пакет сохранен.")
-            st.session_state.show_markup = False
-            st.rerun()
-
-# --- РЕЖИМ 2: СТАНДАРТНЫЙ ДАШБОРД АНАЛИТИКИ ШЛИФА ---
-else:
-    uploaded_file = st.file_uploader(
-        "Выберите микрофотографию рудного шлифа для автоматической сегментации фаз",
-        type=["tiff", "tif", "png", "jpg", "jpeg"]
-    )
-
-    if uploaded_file is not None:
-        temp_path = "temp_core_analysis.jpg"
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
-        with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
-            result = cached_analyze(temp_path)
-            result["original_image_path"] = temp_path
-
-            if "metrics" in result:
-                thin_pct = result["metrics"].get("thin_percent_of_sulfides", 0)
-                result["metrics"]["ordinary_percent_of_sulfides"] = round(100.0 - thin_pct, 2)
-
-        verdict = result["verdict"]
-        if verdict == "Оталькованная":
-            status_badge = '<span style="color: #0080C8; font-weight: bold;">🔵 Оталькованная руда</span>'
-        elif verdict == "Рядовой" or verdict == "Рядовая":
-            status_badge = '<span style="color: #28A745; font-weight: bold;">🟢 Рядовая руда</span>'
+            st.success("✅ Экспорт завершен! Пакет сохранен в папку `active_learning_dataset/`.")
         else:
-            status_badge = '<span style="color: #DC3545; font-weight: bold;">🔴 Труднообогатимая руда</span>'
+            st.warning("Нанесите разметку перед отправкой.")
 
-        st.markdown(f"### Экспресс-оценка образца: {status_badge}", unsafe_allow_html=True)
-        st.info(f"**Официальное заключение автоматизированной системы:** {result['conclusion']}")
 
-        st.markdown("##### Интерактивный анализ и верификация фаз")
+# --- ГЛАВНАЯ СТРАНИЦА ---
+st.markdown('<div class="brand-header">НОРНИКЕЛЬ</div>', unsafe_allow_html=True)
+st.markdown('<div class="brand-subtitle">Цифровая лаборатория обогащения | Автоклассификация руд</div>',
+            unsafe_allow_html=True)
+st.divider()
 
-        orig_bgr = cv2.imread(temp_path)
-        orig_resized = resize_if_large(orig_bgr, 1500)
-        overlay_bgr = result["overlay_image"]
+uploaded_file = st.file_uploader(
+    "Выберите микрофотографию рудного шлифа для автоматической сегментации фаз",
+    type=["tiff", "tif", "png", "jpg", "jpeg"]
+)
 
-        main_col1, main_col2 = st.columns([1.2, 1.8])
+if uploaded_file is not None:
+    temp_path = "temp_core_analysis.jpg"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-        with main_col2:
-            st.markdown(
-                "<div style='margin-bottom: 5px; font-weight: 600; color: #2A2A2A;'>Управление слоями разметки:</div>",
-                unsafe_allow_html=True)
-            show_mask = st.checkbox("Отображать маску ML", value=True)
-            mask_alpha = st.slider("Прозрачность маски", min_value=0.0, max_value=1.0, value=0.45, step=0.05,
-                                   disabled=not show_mask)
+    with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
+        result = analyzer.analyze(temp_path)
+        result["original_image_path"] = temp_path
 
-        if show_mask and overlay_bgr is not None:
-            blended_bgr = cv2.addWeighted(orig_resized, 1.0 - mask_alpha, overlay_bgr, mask_alpha, 0)
-            display_rgb = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
-        else:
-            display_rgb = cv2.cvtColor(orig_resized, cv2.COLOR_BGR2RGB)
+        if "metrics" in result:
+            thin_pct = result["metrics"].get("thin_percent_of_sulfides", 0)
+            result["metrics"]["ordinary_percent_of_sulfides"] = round(100.0 - thin_pct, 2)
 
-        with main_col1:
-            st.image(display_rgb, use_column_width=True)
-
-        with main_col2:
-            st.markdown("""
-            <div style="background-color: #F8F9FA; padding: 12px; border-radius: 4px; border: 1px solid #E2E8F0; margin-top: 12px; margin-bottom: 15px;">
-                <strong style="color: #2A2A2A !important; display: block; margin-bottom: 8px;">Легенда карты фаз:</strong>
-                <div style="display: flex; align-items: center; margin-bottom: 6px;">
-                    <svg width="12" height="12" style="margin-right: 8px; flex-shrink: 0;"><rect width="12" height="12" rx="2" fill="#28A745" /></svg>
-                    <span style="color: #2A2A2A !important; font-size: 13px;"><strong>Зеленый:</strong> Обычные срастания (Рядовая)</span>
-                </div>
-                <div style="display: flex; align-items: center; margin-bottom: 6px;">
-                    <svg width="12" height="12" style="margin-right: 8px; flex-shrink: 0;"><rect width="12" height="12" rx="2" fill="#DC3545" /></svg>
-                    <span style="color: #2A2A2A !important; font-size: 13px;"><strong>Красный:</strong> Тонкие срастания (Труднообогатимая)</span>
-                </div>
-                <div style="display: flex; align-items: center;">
-                    <svg width="12" height="12" style="margin-right: 8px; flex-shrink: 0;"><rect width="12" height="12" rx="2" fill="#0080C8" /></svg>
-                    <span style="color: #2A2A2A !important; font-size: 13px;"><strong>Синий:</strong> Тальк (&gt;10% площади)</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True):
-                bg_img = Image.open(temp_path).convert("RGB")
-                st.session_state.orig_w, st.session_state.orig_h = bg_img.size
-
-                st.session_state.markup_filename = uploaded_file.name
-                st.session_state.current_verdict = verdict
-
-                # Фиксируем токен времени для текущей сессии разметки
-                st.session_state.markup_time = datetime.datetime.now().isoformat()
-                st.session_state.show_markup = True
-                st.rerun()
-
-        st.divider()
-
-        st.markdown("##### Сводные количественные параметры шлифа")
-        m = result["metrics"]
-
-        df_metrics = pd.DataFrame({
-            "Технологический параметр микроструктуры": [
-                "Массовая доля талька в нерудной матрице",
-                "Общая интегральная доля сульфидных фаз",
-                "Доля крупных рядовых сульфидных зерен",
-                "Доля тонкодисперсных труднообогатимых срастаний",
-                "Общее количество распознанных включений",
-                "Линейное разрешение панорамы анализа"
-            ],
-            "Значение": [
-                f"{m['talc_percent']}%",
-                f"{m['sulfide_percent']}%",
-                f"{m['ordinary_percent_of_sulfides']}%",
-                f"{m['thin_percent_of_sulfides']}%",
-                f"{m['n_inclusions']} ед.",
-                f"{m['image_size']} px"
-            ]
-        })
-        st.table(df_metrics)
-
-        st.markdown("##### Формирование отчетных документов")
-        btn_col1, btn_col2, btn_col3 = st.columns(3)
-
-        with btn_col1:
-            if export_csv:
-                csv_buffer = BytesIO()
-                csv_df = pd.DataFrame([{
-                    "Доля талька": f"{m.get('talc_percent', 0)} %",
-                    "Общая доля сульфидов": f"{m.get('sulfide_percent', 0)} %",
-                    "Обычные срастания": f"{m.get('ordinary_percent_of_sulfides', 0)} %",
-                    "Тонкие срастания": f"{m.get('thin_percent_of_sulfides', 0)} %",
-                    "Количество включений": m.get('n_inclusions', 0),
-                    "Размер кадра": m.get('image_size', '-')
-                }])
-                csv_df.to_csv(csv_buffer, index=False, sep=";")
-                st.download_button("💾 Экспорт в CSV", csv_buffer.getvalue(), file_name="nornickel_metrics.csv",
-                                   mime="text/csv", use_container_width=True)
-
-        with btn_col2:
-            if export_pdf:
-                pdf_path = "nornickel_passport.pdf"
-                export_pdf(result, pdf_path)
-                if os.path.exists(pdf_path):
-                    with open(pdf_path, "rb") as f:
-                        st.download_button("📄 Сгенерировать PDF", f.read(), file_name="nornickel_passport.pdf",
-                                           mime="application/pdf", use_container_width=True)
-
-        with btn_col3:
-            if export_geojson:
-                geojson_path = "nornickel_gis_contours.geojson"
-                export_geojson(result, geojson_path)
-                if os.path.exists(geojson_path):
-                    with open(geojson_path, "rb") as f:
-                        st.download_button("🗺️ Выгрузить GeoJSON", f.read(),
-                                           file_name="nornickel_gis_contours.geojson", mime="application/geo+json",
-                                           use_container_width=True)
+    verdict = result["verdict"]
+    if verdict == "Оталькованная":
+        status_badge = '<span style="color: #0080C8; font-weight: bold;">🔵 Оталькованная руда</span>'
+    elif verdict == "Рядовой":
+        status_badge = '<span style="color: #28A745; font-weight: bold;">🟢 Рядовая руда</span>'
     else:
-        st.info(
-            "Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
+        status_badge = '<span style="color: #DC3545; font-weight: bold;">🔴 Труднообогатимая руда</span>'
+
+    st.markdown(f"### Экспресс-оценка образца: {status_badge}", unsafe_allow_html=True)
+    st.info(f"**Официальное заключение автоматизированной системы:** {result['conclusion']}")
+
+    st.markdown("##### Интерактивный анализ и верификация фаз")
+
+    orig_bgr = cv2.imread(temp_path)
+    orig_resized = resize_if_large(orig_bgr, 1500)
+    overlay_bgr = result["overlay_image"]
+
+    main_col1, main_col2 = st.columns([1.3, 1.7])
+
+    with main_col2:
+        st.markdown(
+            "<div style='margin-bottom: 5px; font-weight: 600; color: #2A2A2A;'>Управление слоями разметки:</div>",
+            unsafe_allow_html=True)
+        show_mask = st.checkbox("Отображать маску ML", value=True)
+        mask_alpha = st.slider("Прозрачность маски", min_value=0.0, max_value=1.0, value=0.45, step=0.05,
+                               disabled=not show_mask)
+
+    if show_mask and overlay_bgr is not None:
+        blended_bgr = cv2.addWeighted(orig_resized, 1.0 - mask_alpha, overlay_bgr, mask_alpha, 0)
+        display_rgb = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
+    else:
+        display_rgb = cv2.cvtColor(orig_resized, cv2.COLOR_BGR2RGB)
+
+    with main_col1:
+        st.image(display_rgb, use_column_width=True)
+
+    with main_col2:
+        st.markdown("""
+        <div style="background-color: #F8F9FA; padding: 12px; border-radius: 4px; border: 1px solid #E2E8F0; margin-top: 12px; margin-bottom: 15px;">
+            <strong style="color: #2A2A2A !important; display: block; margin-bottom: 8px;">Легенда карты фаз:</strong>
+            <div style="display: flex; align-items: center; margin-bottom: 6px;">
+                <svg width="12" height="12" style="margin-right: 8px; flex-shrink: 0;"><rect width="12" height="12" rx="2" fill="#28A745" /></svg>
+                <span style="color: #2A2A2A !important; font-size: 13px;"><strong>Зеленый:</strong> Обычные срастания (Рядовая)</span>
+            </div>
+            <div style="display: flex; align-items: center; margin-bottom: 6px;">
+                <svg width="12" height="12" style="margin-right: 8px; flex-shrink: 0;"><rect width="12" height="12" rx="2" fill="#DC3545" /></svg>
+                <span style="color: #2A2A2A !important; font-size: 13px;"><strong>Красный:</strong> Тонкие срастания (Труднообогатимая)</span>
+            </div>
+            <div style="display: flex; align-items: center;">
+                <svg width="12" height="12" style="margin-right: 8px; flex-shrink: 0;"><rect width="12" height="12" rx="2" fill="#0080C8" /></svg>
+                <span style="color: #2A2A2A !important; font-size: 13px;"><strong>Синий:</strong> Тальк (&gt;10% площади)</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True):
+            show_markup_modal(temp_path, uploaded_file.name, verdict)
+
+    st.divider()
+
+    st.markdown("##### Сводные количественные параметры шлифа")
+    m = result["metrics"]
+
+    df_metrics = pd.DataFrame({
+        "Технологический параметр микроструктуры": [
+            "Массовая доля талька в нерудной матрице",
+            "Общая интегральная доля сульфидных фаз",
+            "Доля крупных рядовых сульфидных зерен",
+            "Доля тонкодисперсных труднообогатимых срастаний",
+            "Общее количество распознанных включений",
+            "Линейное разрешение панорамы анализа"
+        ],
+        "Значение": [
+            f"{m['talc_percent']}%",
+            f"{m['sulfide_percent']}%",
+            f"{m['ordinary_percent_of_sulfides']}%",
+            f"{m['thin_percent_of_sulfides']}%",
+            f"{m['n_inclusions']} ед.",
+            f"{m['image_size']} px"
+        ]
+    })
+    st.table(df_metrics)
+
+    st.markdown("##### Формирование отчетных документов")
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+    with btn_col1:
+        if export_csv:
+            csv_path = "nornickel_metrics.csv"
+            export_csv(m, csv_path)
+            with open(csv_path, "rb") as f:
+                st.download_button("💾 Экспорт в CSV", f, file_name="nornickel_metrics.csv", mime="text/csv",
+                                   use_container_width=True)
+
+    with btn_col2:
+        if export_pdf:
+            pdf_path = "nornickel_passport.pdf"
+            export_pdf(result, pdf_path)
+            with open(pdf_path, "rb") as f:
+                st.download_button("📄 Сгенерировать PDF", f, file_name="nornickel_passport.pdf",
+                                   mime="application/pdf", use_container_width=True)
+
+    with btn_col3:
+        if export_geojson:
+            geojson_path = "nornickel_gis_contours.geojson"
+            export_geojson(result, geojson_path)
+            if os.path.exists(geojson_path):
+                with open(geojson_path, "rb") as f:
+                    st.download_button("🗺️ Выгрузить GeoJSON", f, file_name="nornickel_gis_contours.geojson",
+                                       mime="application/geo+json", use_container_width=True)
+
+else:
+    st.info(
+        "Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
 
 st.markdown(
     '<div class="brand-footer">ПАО ГМК «Норильский никель» © 2026. Разработано в рамках хакатона автоматизации анализа шлифов.</div>',
