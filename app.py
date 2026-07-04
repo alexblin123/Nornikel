@@ -130,9 +130,9 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             canvas_height = int(orig_h * w_percent)
 
             bg_img_resized = bg_img.resize(
-                (canvas_width, canvas_height),
+                (int(canvas_width), int(canvas_height)),
                 Image.Resampling.LANCZOS
-            )
+            ).convert("RGB")
 
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
