@@ -27,24 +27,13 @@ class PDFReport(FPDF):
         super().__init__(*args, **kwargs)
         self.has_cyrillic = False
 
-        windir = os.environ.get("WINDIR", "C:/Windows")
-        possible_fonts = [
-            os.path.join(windir, "Fonts", "arial.ttf"),
-            os.path.join(windir, "Fonts", "calibri.ttf"),
-            os.path.join(windir, "Fonts", "tahoma.ttf"),
-            "arial.ttf",
-            "DejaVuSans.ttf"
-        ]
-        for font_path in possible_fonts:
-            if os.path.exists(font_path):
-                try:
-                    self.add_font("Cyrillic", "", font_path)
-                    bold_path = font_path.replace("arial.ttf", "arialbd.ttf").replace("calibri.ttf", "calibrib.ttf")
-                    self.add_font("Cyrillic", "B", bold_path if os.path.exists(bold_path) else font_path)
-                    self.has_cyrillic = True
-                    break
-                except Exception:
-                    continue
+        font_regular = os.path.join("fonts", "DejaVuSans.ttf")
+        font_bold = os.path.join("fonts", "DejaVuSans-Bold.ttf")
+
+        self.add_font("Cyrillic", "", font_regular)
+        self.add_font("Cyrillic", "B", font_bold)
+
+        self.has_cyrillic = True
 
     def header(self):
         self.set_fill_color(0, 128, 200)
