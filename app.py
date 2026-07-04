@@ -76,7 +76,7 @@ def mask_to_base64(mask_array):
 
 
 # --- 🖍️ ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
-@st.experimental_dialog("Режим экспертной разметки (Обучение с подкреплением)")
+@st.dialog("Режим экспертной разметки (Обучение с подкреплением)")
 def show_markup_modal(saved_img_path, original_filename, original_verdict):
     modal_left, modal_right = st.columns([1.1, 2.9])
 
