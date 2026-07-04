@@ -10,7 +10,7 @@ import pandas as pd
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-# Импортируем анализатор и утилиту ресайза
+# Импортируем анализатор
 from analyzer import ShlifAnalyzer, resize_if_large
 
 analyzer = ShlifAnalyzer()
@@ -19,6 +19,27 @@ try:
     from report import export_csv, export_pdf, export_geojson
 except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
+
+
+# --- 🚀 КЕШИРОВАНИЕ ДАННЫХ АНАЛИЗА ---
+@st.cache_data
+def cached_analyze(temp_path):
+    return analyzer.analyze(temp_path)
+
+
+# --- 🖍️ КЕШИРОВАНИЕ ПОДЛОЖКИ ХОЛСТА (Убирает белый экран и ошибки массивов) ---
+@st.cache_resource
+def get_clean_canvas_bg(img_path, target_width=750):
+    try:
+        img = Image.open(img_path).convert("RGB")
+        orig_w, orig_h = img.size
+        w_percent = target_width / float(orig_w)
+        canvas_height = int(orig_h * w_percent)
+        resized_img = img.resize((target_width, canvas_height), Image.Resampling.LANCZOS)
+        return resized_img, target_width, canvas_height
+    except Exception as e:
+        return None, 750, 500
+
 
 # --- НАСТРОЙКА СТРАНИЦЫ ---
 st.set_page_config(
@@ -34,7 +55,7 @@ st.markdown("""
         [data-testid="stHeader"] { display: none !important; }
         .stMarkdown, p, label, h3, h5, span, th, td, div { color: #2A2A2A !important; }
 
-        .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 0px; margin-top: -30px; }
+        .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 2px; margin-top: -10px; }
         .brand-subtitle { color: #7F8C8D !important; font-size: 13px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
 
         .stAlert { border-left: 5px solid #0080C8 !important; background-color: #F4F9FC !important; padding: 0.5rem !important; }
@@ -85,7 +106,6 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
                     unsafe_allow_html=True)
         drawing_mode = st.radio("Инструмент:", ("Кисть", "Полигон"), horizontal=True, label_visibility="collapsed")
 
-        # Исправленный размер кисти от 1 до 10
         st.markdown("<div style='font-weight: 600; font-size: 14px; margin-top: 5px;'>Размер кисти:</div>",
                     unsafe_allow_html=True)
         brush_size = st.slider("Размер кисти:", min_value=1, max_value=10, value=3, label_visibility="collapsed")
@@ -119,44 +139,27 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
     actual_mode = "freedraw" if drawing_mode == "Кисть" else "polygon"
 
     with modal_right:
-        try:
-            bg_img = Image.open(saved_img_path).convert("RGB")
-            orig_w, orig_h = bg_img.size
+        # 🟢 НА ТИВНАЯ ЗАГРУЗКА: Получаем стабильный закешированный PIL-объект подложки
+        bg_img_resized, canvas_width, canvas_height = get_clean_canvas_bg(saved_img_path, 750)
 
-            base_canvas_width = 750
-            canvas_width = base_canvas_width
-            w_percent = canvas_width / float(orig_w)
-            canvas_height = int(orig_h * w_percent)
+        # Читаем размеры оригинала для последующего ресайза масок
+        orig_img_full = Image.open(saved_img_path)
+        orig_w, orig_h = orig_full_size = orig_img_full.size
 
-            # Кодируем фон в base64 и кладём его ПОД холст через CSS
-            buffer = BytesIO()
-            bg_img.resize((canvas_width, canvas_height),
-                          Image.Resampling.LANCZOS).save(buffer, format="PNG")
-            bg_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-            st.markdown(f"""
-                <style>
-                    div[data-testid="stCanvas"] {{
-                        background-image: url("data:image/png;base64,{bg_b64}");
-                        background-size: {canvas_width}px {canvas_height}px;
-                        background-repeat: no-repeat;
-                    }}
-                </style>
-            """, unsafe_allow_html=True)
-
+        if bg_img_resized is not None:
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_image=None,
+                background_image=bg_img_resized,  # Передаем картинку прямо в компонент холста
                 update_streamlit=True,
                 height=canvas_height,
                 width=canvas_width,
                 drawing_mode=actual_mode,
-                key=f"modal_expert_canvas_{original_filename}",
+                key=f"canvas_stable_{original_filename}",  # Статический контролируемый ключ
             )
-        except Exception as e:
-            st.error(f"Ошибка загрузки холста: {e}")
+        else:
+            st.error("Не удалось сформировать подложку для графического редактора.")
             canvas_result = None
 
     # --- СОХРАНЕНИЕ JSON ---
@@ -230,7 +233,7 @@ if uploaded_file is not None:
         f.write(uploaded_file.getbuffer())
 
     with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
-        result = analyzer.analyze(temp_path)
+        result = cached_analyze(temp_path)
         result["original_image_path"] = temp_path
 
         if "metrics" in result:
