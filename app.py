@@ -2,11 +2,12 @@ import os
 import cv2
 import json
 import base64
+import zipfile
+import tempfile
+import shutil
 import datetime
 from io import BytesIO
-
 import streamlit as st
-
 st.set_page_config(
     page_title="НОРНИКЕЛЬ | Автоматизация анализа шлифов",
     page_icon=None,
@@ -17,26 +18,25 @@ import pandas as pd
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas, CanvasResult
 
-
 # 🟢 ГЛОБАЛЬНЫЙ ПАТЧ: Убиваем ошибку "The truth value of an array is ambiguous".
-# Это отключает сломанный механизм сравнения массивов внутри ядра Streamlit.
 def safe_eq(self, other):
     return False
 
+def safe_ne(self, other):
+    return True
+
+def safe_bool(self):
+    return True
 
 CanvasResult.__eq__ = safe_eq
-
+CanvasResult.__ne__ = safe_ne
+CanvasResult.__bool__ = safe_bool
 from analyzer import ShlifAnalyzer, resize_if_large
-
 analyzer = ShlifAnalyzer()
-
 try:
     from report import export_csv, export_pdf, export_geojson
 except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
-
-# --- НАСТРОЙКА СТРАНИЦЫ ---
-
 
 # --- ИНЪЕКЦИЯ КОРПОРАТИВНОГО СТИЛЯ ---
 st.markdown("""
@@ -44,7 +44,6 @@ st.markdown("""
         [data-testid="stAppViewContainer"] { background-color: #FFFFFF !important; }
         [data-testid="stHeader"] { display: none !important; }
         .stMarkdown, p, label, h3, h5, span, th, td, div { color: #2A2A2A !important; }
-
         .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 0px; margin-top: -30px; }
         .brand-subtitle { color: #7F8C8D !important; font-size: 13px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
         .stAlert { border-left: 5px solid #0080C8 !important; background-color: #F4F9FC !important; padding: 0.5rem !important; }
@@ -55,8 +54,6 @@ st.markdown("""
         .brand-footer { text-align: center; color: #95A5A6; font-size: 12px; margin-top: 50px; border-top: 1px solid #E2E8F0; padding-top: 15px; }
         button[title="View fullscreen"] { display: none !important; }
         [data-testid="stImageHoverButtons"] { display: none !important; visibility: hidden !important; }
-
-        /* Расширяем модальное окно на 95% ширины экрана */
         div[role="dialog"] {
             width: 95vw !important;
             max-width: 1350px !important;
@@ -68,13 +65,11 @@ st.markdown("""
             max-width: 1350px !important;
             gap: 0.5rem !important;
         }
-
         .stRadio { margin-bottom: -10px !important; }
         .stSlider { margin-bottom: -10px !important; }
         hr { margin: 0.4em 0 !important; }
     </style>
 """, unsafe_allow_html=True)
-
 
 def mask_to_base64(mask_array):
     img_pil = Image.fromarray(mask_array.astype(np.uint8))
@@ -82,17 +77,19 @@ def mask_to_base64(mask_array):
     img_pil.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+# --- СОСТОЯНИЕ ---
+if "batch_dir" not in st.session_state:
+    st.session_state.batch_dir = None
+if "batch_summary" not in st.session_state:
+    st.session_state.batch_summary = None
+if "batch_files" not in st.session_state:
+    st.session_state.batch_files = []
 
-# --- ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ПЕРЕКЛЮЧЕНИЯ СТРАНИЦ ---
-if "show_markup" not in st.session_state:
-    st.session_state.show_markup = False
-
-# --- ШАПКА ПЛАТФОРМЫ ---
+# --- ШАПКА ---
 st.markdown('<div class="brand-header">НОРНИКЕЛЬ</div>', unsafe_allow_html=True)
 st.markdown('<div class="brand-subtitle">Цифровая лаборатория обогащения | Автоклассификация руд</div>',
             unsafe_allow_html=True)
 st.divider()
-
 
 # --- 🖍️ ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
 @st.dialog("Режим экспертной разметки (Обучение с подкреплением)")
@@ -102,8 +99,6 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
         st.markdown("<div style='font-weight: 600; font-size: 14px;'>Инструмент рисования:</div>",
                     unsafe_allow_html=True)
         drawing_mode = st.radio("Инструмент:", ("Кисть", "Полигон"), horizontal=True, label_visibility="collapsed")
-
-        # Исправленный размер кисти от 1 до 10
         st.markdown("<div style='font-weight: 600; font-size: 14px; margin-top: 5px;'>Размер кисти:</div>",
                     unsafe_allow_html=True)
         brush_size = st.slider("Размер кисти:", min_value=1, max_value=10, value=3, label_visibility="collapsed")
@@ -129,9 +124,7 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
         )
         st.markdown("<br><br>", unsafe_allow_html=True)
         submit_clicked = st.button("💾 Зафиксировать и отправить в ML", use_container_width=True)
-
     actual_mode = "freedraw" if drawing_mode == "Кисть" else "polygon"
-
     canvas_result = None
     canvas_width = canvas_height = 0
     orig_w = orig_h = 0
@@ -139,20 +132,11 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
         try:
             bg_img = Image.open(saved_img_path).convert("RGB")
             orig_w, orig_h = bg_img.size
-
             base_canvas_width = 750
-
             canvas_width = base_canvas_width
             w_percent = canvas_width / float(orig_w)
             canvas_height = int(orig_h * w_percent)
-
-            bg_img_resized = np.array(
-                bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
-            )
-
-            # bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
-            
-
+            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
@@ -167,31 +151,24 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
         except Exception as e:
             st.error(f"Ошибка инициализации рабочей области: {e}")
             canvas_result = None
-
-    # --- СОХРАНЕНИЕ ---
     if submit_clicked and canvas_result is not None:
         if canvas_result.image_data is not None:
             drawn_rgba = canvas_result.image_data
             mask_ordinary = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
             mask_thin = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
             mask_talc = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
-
             green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (
                     drawn_rgba[:, :, 3] > 0)
             mask_ordinary[green_pixels] = 255
-
             red_pixels = (drawn_rgba[:, :, 0] > 150) & (drawn_rgba[:, :, 1] < 100) & (drawn_rgba[:, :, 2] < 100) & (
                     drawn_rgba[:, :, 3] > 0)
             mask_thin[red_pixels] = 255
-
             blue_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 50) & (drawn_rgba[:, :, 2] > 150) & (
                     drawn_rgba[:, :, 3] > 0)
             mask_talc[blue_pixels] = 255
-
             mask_ordinary_orig = cv2.resize(mask_ordinary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
             mask_thin_orig = cv2.resize(mask_thin, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
             mask_talc_orig = cv2.resize(mask_talc, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-
             export_payload = {
                 "image_id": original_filename,
                 "image_size": {"width": orig_w, "height": orig_h},
@@ -213,69 +190,51 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_thin_{original_filename}.png"), mask_thin_orig)
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_talc_{original_filename}.png"), mask_talc_orig)
             st.success("✅ Экспорт завершен! Пакет сохранен в папку `active_learning_dataset/`.")
-
-            # Сохраняем исходное фото (нужно для дообучения U-Net)            
-            orig_for_train = cv2.imread(saved_img_path)            
-            if orig_for_train is not None:            
+            orig_for_train = cv2.imread(saved_img_path)
+            if orig_for_train is not None:
                 cv2.imwrite(os.path.join("active_learning_dataset", f"image_{original_filename}.png"), orig_for_train)
-
         else:
             st.warning("Нанесите разметку перед отправкой.")
 
 
-# --- РЕЖИМ 2: СТАНДАРТНЫЙ ДАШБОРД АНАЛИТИКИ ШЛИФА ---
-uploaded_file = st.file_uploader(
-    "Выберите микрофотографию рудного шлифа для автоматической сегментации фаз",
-    type=["tiff", "tif", "png", "jpg", "jpeg"]
-)
-
-if uploaded_file is not None:
-    temp_path = "temp_core_analysis.jpg"
-    with open(temp_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
+# --- ФУНКЦИЯ ПОЛНОГО АНАЛИЗА (используется и для одиночного, и для выбранного из ZIP) ---
+def render_full_analysis(image_path, display_name, key_prefix=""):
     with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
-        result = analyzer.analyze(temp_path)
-        result["original_image_path"] = temp_path
+        result = analyzer.analyze(image_path)
+        result["original_image_path"] = image_path
         if "metrics" in result:
             thin_pct = result["metrics"].get("thin_percent_of_sulfides", 0)
             result["metrics"]["ordinary_percent_of_sulfides"] = round(100.0 - thin_pct, 2)
-
     verdict = result["verdict"]
     if verdict == "Оталькованная":
         status_badge = '<span style="color: #0080C8; font-weight: bold;">🔵 Оталькованная руда</span>'
-    elif verdict == "Рядовой":
+    elif verdict == "Рядовая":
         status_badge = '<span style="color: #28A745; font-weight: bold;">🟢 Рядовая руда</span>'
     else:
         status_badge = '<span style="color: #DC3545; font-weight: bold;">🔴 Труднообогатимая руда</span>'
     st.markdown(f"### Экспресс-оценка образца: {status_badge}", unsafe_allow_html=True)
     st.info(f"**Официальное заключение автоматизированной системы:** {result['conclusion']}")
-
     st.markdown("##### Интерактивный анализ и верификация фаз")
-
-    orig_bgr = cv2.imread(temp_path)
+    orig_bgr = cv2.imread(image_path)
     orig_resized = resize_if_large(orig_bgr, 1500)
     overlay_bgr = result["overlay_image"]
-
     main_col1, main_col2 = st.columns([1.3, 1.7])
     with main_col2:
         st.markdown("<div style='margin-bottom: 5px; font-weight: 600; color: #2A2A2A;'>Управление слоями разметки:</div>",
                     unsafe_allow_html=True)
-        show_mask = st.checkbox("Отображать маску ML", value=True)
+        show_mask = st.checkbox("Отображать маску ML", value=True, key=f"{key_prefix}_show_mask")
         mask_alpha = st.slider("Прозрачность маски", min_value=0.0, max_value=1.0, value=0.45, step=0.05,
-                               disabled=not show_mask)
-        # НОВОЕ: тепловая карта талька (Фича 6)
+                               disabled=not show_mask, key=f"{key_prefix}_alpha")
         has_heatmap = result.get("talc_heatmap") is not None
         show_heatmap = st.checkbox(
             "🔥 Тепловая карта талька (U-Net)",
             value=False,
             disabled=not has_heatmap,
-            help="Вероятность присутствия талька по данным нейросети U-Net"
+            help="Вероятность присутствия талька по данным нейросети U-Net",
+            key=f"{key_prefix}_heatmap"
         )
-
-    # выбор изображения для показа
     if show_heatmap and has_heatmap:
-        heat = result["talc_heatmap"]  # 0..1
+        heat = result["talc_heatmap"]
         hm_color = cv2.applyColorMap((heat * 255).astype(np.uint8), cv2.COLORMAP_JET)
         blended_bgr = cv2.addWeighted(orig_resized, 0.55, hm_color, 0.45, 0)
         display_rgb = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
@@ -284,10 +243,8 @@ if uploaded_file is not None:
         display_rgb = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
     else:
         display_rgb = cv2.cvtColor(orig_resized, cv2.COLOR_BGR2RGB)
-
     with main_col1:
         st.image(display_rgb, use_column_width=True)
-
     with main_col2:
         st.markdown("""
         <div style="background-color: #F8F9FA; padding: 12px; border-radius: 4px; border: 1px solid #E2E8F0; margin-top: 12px; margin-bottom: 15px;">
@@ -306,14 +263,10 @@ if uploaded_file is not None:
             </div>
         </div>
         """, unsafe_allow_html=True)
-
-        # НОВОЕ: источник детекции талька
         talc_src = result["metrics"].get("talc_source", "не обнаружен")
         st.caption(f"Источник детекции талька: **{talc_src}**")
-
-        if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True):
-            show_markup_modal(temp_path, uploaded_file.name, verdict)
-
+        if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True, key=f"{key_prefix}_markup_btn"):
+            show_markup_modal(image_path, display_name, verdict)
     st.divider()
     st.markdown("##### Сводные количественные параметры шлифа")
     m = result["metrics"]
@@ -336,7 +289,6 @@ if uploaded_file is not None:
         ]
     })
     st.table(df_metrics)
-
     st.markdown("##### Формирование отчетных документов")
     btn_col1, btn_col2, btn_col3 = st.columns(3)
     with btn_col1:
@@ -345,14 +297,14 @@ if uploaded_file is not None:
             export_csv(m, csv_path)
             with open(csv_path, "rb") as f:
                 st.download_button("💾 Экспорт в CSV", f, file_name="nornickel_metrics.csv", mime="text/csv",
-                                   use_container_width=True)
+                                   use_container_width=True, key=f"{key_prefix}_csv")
     with btn_col2:
         if export_pdf:
             pdf_path = "nornickel_passport.pdf"
             export_pdf(result, pdf_path)
             with open(pdf_path, "rb") as f:
                 st.download_button("📄 Сгенерировать PDF", f, file_name="nornickel_passport.pdf",
-                                   mime="application/pdf", use_container_width=True)
+                                   mime="application/pdf", use_container_width=True, key=f"{key_prefix}_pdf")
     with btn_col3:
         if export_geojson:
             geojson_path = "nornickel_gis_contours.geojson"
@@ -360,7 +312,132 @@ if uploaded_file is not None:
             if os.path.exists(geojson_path):
                 with open(geojson_path, "rb") as f:
                     st.download_button("🗺️ Выгрузить GeoJSON", f, file_name="nornickel_gis_contours.geojson",
-                                       mime="application/geo+json", use_container_width=True)
+                                       mime="application/geo+json", use_container_width=True, key=f"{key_prefix}_geo")
+    return result
+
+
+# ============================================================
+# РЕЖИМ 1: ОДИНОЧНЫЙ АНАЛИЗ
+# ============================================================
+uploaded_file = st.file_uploader(
+    "Выберите микрофотографию рудного шлифа для автоматической сегментации фаз",
+    type=["tiff", "tif", "png", "jpg", "jpeg"]
+)
+if uploaded_file is not None:
+    temp_path = "temp_core_analysis.jpg"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    render_full_analysis(temp_path, uploaded_file.name, key_prefix="single")
 else:
     st.info(
         "Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
+
+
+# ============================================================
+# РЕЖИМ 2: ПАКЕТНАЯ ОБРАБОТКА (ZIP) → ТАБЛИЦА + ВЫБОР ФОТО
+# ============================================================
+st.divider()
+st.markdown("##### 📦 Пакетная обработка серии образцов")
+st.caption("Загрузите ZIP-архив с микрофотографиями. Система обработает все образцы и выведет сводку. "
+           "Любой образец можно открыть для детального анализа.")
+zip_file = st.file_uploader("ZIP-архив с изображениями шлифов", type=["zip"], key="batch_zip")
+
+if zip_file is not None:
+    # обрабатываем архив только один раз (кешируем в session_state по имени)
+    if st.session_state.get("batch_zip_name") != zip_file.name:
+        # очистить старую распаковку
+        if st.session_state.batch_dir and os.path.exists(st.session_state.batch_dir):
+            shutil.rmtree(st.session_state.batch_dir, ignore_errors=True)
+        persist_dir = tempfile.mkdtemp(prefix="batch_")
+        zip_path = os.path.join(persist_dir, "batch.zip")
+        with open(zip_path, "wb") as f:
+            f.write(zip_file.getbuffer())
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(persist_dir)
+        except Exception as ex:
+            st.error(f"Не удалось распаковать архив: {ex}")
+
+        valid_ext = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+        img_files = []
+        for root, _, files in os.walk(persist_dir):
+            for fn in files:
+                if fn.lower().endswith(valid_ext) and not fn.startswith("."):
+                    img_files.append(os.path.join(root, fn))
+        img_files = sorted(img_files)
+
+        summary_rows = []
+        log_lines = [f"=== ПАКЕТНАЯ ОБРАБОТКА ===",
+                     f"Время: {datetime.datetime.now().isoformat()}",
+                     f"Архив: {zip_file.name}",
+                     f"Найдено изображений: {len(img_files)}"]
+        progress = st.progress(0)
+        for i, img_path in enumerate(img_files):
+            fname = os.path.basename(img_path)
+            try:
+                res = analyzer.analyze(img_path)
+                mm = res["metrics"]
+                thin_p = mm.get("thin_percent_of_sulfides", 0)
+                summary_rows.append({
+                    "Файл": fname,
+                    "Путь": img_path,
+                    "Вердикт": res["verdict"],
+                    "Тальк %": mm.get("talc_percent"),
+                    "Сульфиды %": mm.get("sulfide_percent"),
+                    "Тонкие %": thin_p,
+                    "Рядовые %": round(100.0 - thin_p, 2),
+                    "Включений": mm.get("n_inclusions"),
+                    "Источник талька": mm.get("talc_source", "не обнаружен")
+                })
+                log_lines.append(f"[{i+1}/{len(img_files)}] {fname} -> {res['verdict']}, тальк {mm.get('talc_percent')}%")
+            except Exception as ex:
+                summary_rows.append({
+                    "Файл": fname, "Путь": img_path, "Вердикт": f"ОШИБКА: {ex}",
+                    "Тальк %": None, "Сульфиды %": None, "Тонкие %": None,
+                    "Рядовые %": None, "Включений": None, "Источник талька": None
+                })
+                log_lines.append(f"[{i+1}/{len(img_files)}] {fname} -> ОШИБКА: {ex}")
+            progress.progress((i + 1) / max(len(img_files), 1))
+
+        st.session_state.batch_dir = persist_dir
+        st.session_state.batch_summary = summary_rows
+        st.session_state.batch_log = "\n".join(log_lines)
+        st.session_state.batch_zip_name = zip_file.name
+
+    # --- вывод сводки (из кеша) ---
+    summary_rows = st.session_state.batch_summary or []
+    if summary_rows:
+        st.success(f"✅ Обработано изображений: {len(summary_rows)}")
+        df_batch = pd.DataFrame(summary_rows).drop(columns=["Путь"])
+        st.dataframe(df_batch, use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            csv_data = df_batch.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("💾 Скачать сводный отчёт (CSV)", csv_data,
+                               file_name="batch_report.csv", mime="text/csv",
+                               use_container_width=True, key="batch_summary_csv")
+        with col_b:
+            st.download_button("📋 Скачать лог обработки (TXT)",
+                               st.session_state.batch_log.encode("utf-8"),
+                               file_name=f"batch_log_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt",
+                               mime="text/plain", use_container_width=True, key="batch_summary_log")
+
+        # --- выбор образца для детального анализа ---
+        st.divider()
+        st.markdown("##### 🔬 Детальный анализ выбранного образца")
+        file_names = [r["Файл"] for r in summary_rows if not str(r["Вердикт"]).startswith("ОШИБКА")]
+        if file_names:
+            selected = st.selectbox("Выберите образец из серии:", file_names, key="batch_select")
+            sel_path = next((r["Путь"] for r in summary_rows if r["Файл"] == selected), None)
+            if sel_path and os.path.exists(sel_path):
+                render_full_analysis(sel_path, selected, key_prefix="batch")
+        else:
+            st.warning("Нет успешно обработанных образцов для детального анализа.")
+    else:
+        st.warning("В архиве не найдено изображений поддерживаемых форматов.")
+
+# --- ФУТЕР ---
+st.markdown(
+    '<div class="brand-footer">ПАО ГМК «Норильский никель» © 2026. Разработано в рамках хакатона автоматизации анализа шлифов.</div>',
+    unsafe_allow_html=True)
