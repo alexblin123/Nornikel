@@ -296,3 +296,10 @@ if __name__ == "__main__":
     if r["overlay_image"] is not None:
         imwrite_unicode("overlay_result.png", r["overlay_image"])
         print("Overlay: overlay_result.png")
+    else:
+        st.info(
+            "Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
+
+    st.markdown(
+        '<div class="brand-footer">ПАО ГМК «Норильский никель» © 2026. Разработано в рамках хакатона автоматизации анализа шлифов.</div>',
+        unsafe_allow_html=True)

@@ -16,3 +16,9 @@ nornickel_metrics.csv
 nornickel_passport.pdf
 nornickel_gis_contours.geojson
 overlay_result.png
+
+talc_dataset/
+temp_core_analysis.jpg
+nornickel_*.csv
+nornickel_*.pdf
+nornickel_*.geojson
