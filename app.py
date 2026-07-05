@@ -5,6 +5,7 @@ import base64
 import datetime
 import tempfile
 from io import BytesIO
+
 import streamlit as st
 
 st.set_page_config(
@@ -12,12 +13,12 @@ st.set_page_config(
     page_icon=None,
     layout="wide"
 )
+
 import numpy as np
 import pandas as pd
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-# Импортируем анализатор и утилиту ресайза
 from analyzer import ShlifAnalyzer, resize_if_large
 
 analyzer = ShlifAnalyzer()
@@ -27,43 +28,24 @@ try:
 except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
 
-# --- НАСТРОЙКА СТРАНИЦЫ ---
-
-
-# --- ИНЪЕКЦИЯ КОРПОРАТИВНОГО СТИЛЯ ---
+# --- СТИЛЬ ---
 st.markdown("""
     <style>
         [data-testid="stAppViewContainer"] { background-color: #FFFFFF !important; }
         [data-testid="stHeader"] { display: none !important; }
         .stMarkdown, p, label, h3, h5, span, th, td, div { color: #2A2A2A !important; }
-
         .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 0px; margin-top: -30px; }
         .brand-subtitle { color: #7F8C8D !important; font-size: 13px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
-
         .stAlert { border-left: 5px solid #0080C8 !important; background-color: #F4F9FC !important; padding: 0.5rem !important; }
         .stAlert p { color: #2A2A2A !important; margin: 0 !important; }
         table { background-color: #FFFFFF !important; color: #2A2A2A !important; font-size: 14px; }
-
         div.stButton > button:first-child { background-color: #0080C8 !important; color: white !important; border-radius: 4px !important; border: none !important; font-weight: 600 !important; transition: background-color 0.3s ease; padding: 0.25rem 0.5rem !important; }
         div.stButton > button:first-child:hover { background-color: #004B78 !important; color: white !important; }
         .brand-footer { text-align: center; color: #95A5A6; font-size: 12px; margin-top: 50px; border-top: 1px solid #E2E8F0; padding-top: 15px; }
-
         button[title="View fullscreen"] { display: none !important; }
         [data-testid="stImageHoverButtons"] { display: none !important; visibility: hidden !important; }
-
-        /* Расширяем модальное окно на 95% ширины экрана */
-        div[role="dialog"] {
-            width: 95vw !important;
-            max-width: 1350px !important;
-            padding: 1rem !important;
-            border-radius: 8px !important;
-        }
-        div[data-testid="stDialog"] {
-            width: 95vw !important;
-            max-width: 1350px !important;
-            gap: 0.5rem !important;
-        }
-
+        div[role="dialog"] { width: 95vw !important; max-width: 1350px !important; padding: 1rem !important; border-radius: 8px !important; }
+        div[data-testid="stDialog"] { width: 95vw !important; max-width: 1350px !important; gap: 0.5rem !important; }
         .stRadio { margin-bottom: -10px !important; }
         .stSlider { margin-bottom: -10px !important; }
         hr { margin: 0.4em 0 !important; }
@@ -78,21 +60,17 @@ def mask_to_base64(mask_array):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-# --- 🖍️ ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
+# --- ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
 @st.dialog("Режим экспертной разметки (Обучение с подкреплением)")
 def show_markup_modal(saved_img_path, original_filename, original_verdict):
     modal_left, modal_right = st.columns([1.1, 2.9])
-
     with modal_left:
         st.markdown("<div style='font-weight: 600; font-size: 14px;'>Инструмент рисования:</div>",
                     unsafe_allow_html=True)
         drawing_mode = st.radio("Инструмент:", ("Кисть", "Полигон"), horizontal=True, label_visibility="collapsed")
-
-        # Исправленный размер кисти от 1 до 10
         st.markdown("<div style='font-weight: 600; font-size: 14px; margin-top: 5px;'>Размер кисти:</div>",
                     unsafe_allow_html=True)
         brush_size = st.slider("Размер кисти:", min_value=1, max_value=10, value=3, label_visibility="collapsed")
-
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown("<div style='font-weight: 600; font-size: 14px;'>Минеральная фаза:</div>", unsafe_allow_html=True)
         phase_choice = st.radio(
@@ -106,41 +84,35 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             stroke_color = "rgba(220, 53, 69, 1)"
         else:
             stroke_color = "rgba(0, 128, 200, 1)"
-
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown("<div style='font-weight: 600; font-size: 14px;'>Экспертный вердикт:</div>", unsafe_allow_html=True)
+        verdict_options = ["Оталькованная", "Рядовая", "Труднообогатимая"]
+        default_idx = verdict_options.index(original_verdict) if original_verdict in verdict_options else 0
         corrected_verdict = st.selectbox(
-            "Verdict",
-            ["Оталькованная", "Рядовой", "Труднообогатимая"],
-            index=["Оталькованная", "Рядовой", "Труднообогатимая"].index(original_verdict),
-            label_visibility="collapsed"
+            "Verdict", verdict_options, index=default_idx, label_visibility="collapsed"
         )
-
         st.markdown("<br><br>", unsafe_allow_html=True)
         submit_clicked = st.button("💾 Зафиксировать и отправить в ML", use_container_width=True)
 
     actual_mode = "freedraw" if drawing_mode == "Кисть" else "polygon"
 
+    canvas_result = None
+    canvas_width = canvas_height = 0
+    orig_w = orig_h = 0
     with modal_right:
         try:
             bg_img = Image.open(saved_img_path).convert("RGB")
             orig_w, orig_h = bg_img.size
-
-            base_canvas_width = 750
-
-            canvas_width = base_canvas_width
+            canvas_width = 750
             w_percent = canvas_width / float(orig_w)
             canvas_height = int(orig_h * w_percent)
-
-            bg_img_resized = np.array(
-                bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
-            )
-
+            # ВАЖНО: передаём PIL.Image, НЕ numpy — так canvas не падает
+            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_image=bg_img_resized,
+                background_image=bg_img_resized,   # PIL.Image
                 update_streamlit=True,
                 height=canvas_height,
                 width=canvas_width,
@@ -151,25 +123,19 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             st.error(f"Ошибка загрузки холста: {e}")
             canvas_result = None
 
-    # --- СОХРАНЕНИЕ JSON ---
+    # --- СОХРАНЕНИЕ ---
     if submit_clicked and canvas_result is not None:
         if canvas_result.image_data is not None:
             drawn_rgba = canvas_result.image_data
-
             mask_ordinary = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
             mask_thin = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
             mask_talc = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
 
-            green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (
-                    drawn_rgba[:, :, 3] > 0)
+            green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (drawn_rgba[:, :, 3] > 0)
             mask_ordinary[green_pixels] = 255
-
-            red_pixels = (drawn_rgba[:, :, 0] > 150) & (drawn_rgba[:, :, 1] < 100) & (drawn_rgba[:, :, 2] < 100) & (
-                    drawn_rgba[:, :, 3] > 0)
+            red_pixels = (drawn_rgba[:, :, 0] > 150) & (drawn_rgba[:, :, 1] < 100) & (drawn_rgba[:, :, 2] < 100) & (drawn_rgba[:, :, 3] > 0)
             mask_thin[red_pixels] = 255
-
-            blue_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 50) & (drawn_rgba[:, :, 2] > 150) & (
-                    drawn_rgba[:, :, 3] > 0)
+            blue_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 50) & (drawn_rgba[:, :, 2] > 150) & (drawn_rgba[:, :, 3] > 0)
             mask_talc[blue_pixels] = 255
 
             mask_ordinary_orig = cv2.resize(mask_ordinary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -189,17 +155,13 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
                 "original_verdict": original_verdict,
                 "corrected_verdict": corrected_verdict
             }
-
             os.makedirs("active_learning_dataset", exist_ok=True)
             json_path = os.path.join("active_learning_dataset", f"markup_{original_filename}.json")
             with open(json_path, "w", encoding="utf-8") as jf:
                 json.dump(export_payload, jf, indent=4, ensure_ascii=False)
-
-            cv2.imwrite(os.path.join("active_learning_dataset", f"mask_ordinary_{original_filename}.png"),
-                        mask_ordinary_orig)
+            cv2.imwrite(os.path.join("active_learning_dataset", f"mask_ordinary_{original_filename}.png"), mask_ordinary_orig)
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_thin_{original_filename}.png"), mask_thin_orig)
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_talc_{original_filename}.png"), mask_talc_orig)
-
             st.success("✅ Экспорт завершен! Пакет сохранен в папку `active_learning_dataset/`.")
         else:
             st.warning("Нанесите разметку перед отправкой.")
@@ -221,10 +183,9 @@ if uploaded_file is not None:
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
+    with st.spinner("Интеллектуальный анализ структуры шлифа..."):
         result = analyzer.analyze(temp_path)
         result["original_image_path"] = temp_path
-
         if "metrics" in result:
             thin_pct = result["metrics"].get("thin_percent_of_sulfides", 0)
             result["metrics"]["ordinary_percent_of_sulfides"] = round(100.0 - thin_pct, 2)
@@ -232,11 +193,10 @@ if uploaded_file is not None:
     verdict = result["verdict"]
     if verdict == "Оталькованная":
         status_badge = '<span style="color: #0080C8; font-weight: bold;">🔵 Оталькованная руда</span>'
-    elif verdict == "Рядовой":
+    elif verdict == "Рядовая":
         status_badge = '<span style="color: #28A745; font-weight: bold;">🟢 Рядовая руда</span>'
     else:
         status_badge = '<span style="color: #DC3545; font-weight: bold;">🔴 Труднообогатимая руда</span>'
-
     st.markdown(f"### Экспресс-оценка образца: {status_badge}", unsafe_allow_html=True)
     st.info(f"**Официальное заключение автоматизированной системы:** {result['conclusion']}")
 
@@ -247,16 +207,28 @@ if uploaded_file is not None:
     overlay_bgr = result["overlay_image"]
 
     main_col1, main_col2 = st.columns([1.3, 1.7])
-
     with main_col2:
-        st.markdown(
-            "<div style='margin-bottom: 5px; font-weight: 600; color: #2A2A2A;'>Управление слоями разметки:</div>",
-            unsafe_allow_html=True)
+        st.markdown("<div style='margin-bottom: 5px; font-weight: 600; color: #2A2A2A;'>Управление слоями разметки:</div>",
+                    unsafe_allow_html=True)
         show_mask = st.checkbox("Отображать маску ML", value=True)
         mask_alpha = st.slider("Прозрачность маски", min_value=0.0, max_value=1.0, value=0.45, step=0.05,
                                disabled=not show_mask)
+        # НОВОЕ: тепловая карта талька (Фича 6)
+        has_heatmap = result.get("talc_heatmap") is not None
+        show_heatmap = st.checkbox(
+            "🔥 Тепловая карта талька (U-Net)",
+            value=False,
+            disabled=not has_heatmap,
+            help="Вероятность присутствия талька по данным нейросети U-Net"
+        )
 
-    if show_mask and overlay_bgr is not None:
+    # выбор изображения для показа
+    if show_heatmap and has_heatmap:
+        heat = result["talc_heatmap"]  # 0..1
+        hm_color = cv2.applyColorMap((heat * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        blended_bgr = cv2.addWeighted(orig_resized, 0.55, hm_color, 0.45, 0)
+        display_rgb = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
+    elif show_mask and overlay_bgr is not None:
         blended_bgr = cv2.addWeighted(orig_resized, 1.0 - mask_alpha, overlay_bgr, mask_alpha, 0)
         display_rgb = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
     else:
@@ -284,14 +256,16 @@ if uploaded_file is not None:
         </div>
         """, unsafe_allow_html=True)
 
+        # НОВОЕ: источник детекции талька
+        talc_src = result["metrics"].get("talc_source", "не обнаружен")
+        st.caption(f"Источник детекции талька: **{talc_src}**")
+
         if st.button("🖍️ Включить режим ручной разметки зон", use_container_width=True):
             show_markup_modal(temp_path, uploaded_file.name, verdict)
 
     st.divider()
-
     st.markdown("##### Сводные количественные параметры шлифа")
     m = result["metrics"]
-
     df_metrics = pd.DataFrame({
         "Технологический параметр микроструктуры": [
             "Массовая доля талька в нерудной матрице",
@@ -314,7 +288,6 @@ if uploaded_file is not None:
 
     st.markdown("##### Формирование отчетных документов")
     btn_col1, btn_col2, btn_col3 = st.columns(3)
-
     with btn_col1:
         if export_csv:
             csv_path = "nornickel_metrics.csv"
@@ -322,7 +295,6 @@ if uploaded_file is not None:
             with open(csv_path, "rb") as f:
                 st.download_button("💾 Экспорт в CSV", f, file_name="nornickel_metrics.csv", mime="text/csv",
                                    use_container_width=True)
-
     with btn_col2:
         if export_pdf:
             pdf_path = "nornickel_passport.pdf"
@@ -330,7 +302,6 @@ if uploaded_file is not None:
             with open(pdf_path, "rb") as f:
                 st.download_button("📄 Сгенерировать PDF", f, file_name="nornickel_passport.pdf",
                                    mime="application/pdf", use_container_width=True)
-
     with btn_col3:
         if export_geojson:
             geojson_path = "nornickel_gis_contours.geojson"
@@ -339,7 +310,5 @@ if uploaded_file is not None:
                 with open(geojson_path, "rb") as f:
                     st.download_button("🗺️ Выгрузить GeoJSON", f, file_name="nornickel_gis_contours.geojson",
                                        mime="application/geo+json", use_container_width=True)
-
 else:
-    st.info(
-        "Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
+    st.info("Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
