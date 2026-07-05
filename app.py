@@ -150,6 +150,9 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
                 bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
             )
 
+            # bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+            
+
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
