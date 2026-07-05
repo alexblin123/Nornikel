@@ -3,7 +3,6 @@ import cv2
 import json
 import base64
 import datetime
-import tempfile
 from io import BytesIO
 
 import streamlit as st
@@ -13,11 +12,19 @@ st.set_page_config(
     page_icon=None,
     layout="wide"
 )
-
 import numpy as np
 import pandas as pd
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
+from streamlit_drawable_canvas import st_canvas, CanvasResult
+
+
+# 🟢 ГЛОБАЛЬНЫЙ ПАТЧ: Убиваем ошибку "The truth value of an array is ambiguous".
+# Это отключает сломанный механизм сравнения массивов внутри ядра Streamlit.
+def safe_eq(self, other):
+    return False
+
+
+CanvasResult.__eq__ = safe_eq
 
 from analyzer import ShlifAnalyzer, resize_if_large
 
@@ -28,12 +35,16 @@ try:
 except ImportError:
     export_csv, export_pdf, export_geojson = None, None, None
 
-# --- СТИЛЬ ---
+# --- НАСТРОЙКА СТРАНИЦЫ ---
+
+
+# --- ИНЪЕКЦИЯ КОРПОРАТИВНОГО СТИЛЯ ---
 st.markdown("""
     <style>
         [data-testid="stAppViewContainer"] { background-color: #FFFFFF !important; }
         [data-testid="stHeader"] { display: none !important; }
         .stMarkdown, p, label, h3, h5, span, th, td, div { color: #2A2A2A !important; }
+
         .brand-header { color: #0080C8 !important; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; font-size: 28px; margin-bottom: 0px; margin-top: -30px; }
         .brand-subtitle { color: #7F8C8D !important; font-size: 13px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
         .stAlert { border-left: 5px solid #0080C8 !important; background-color: #F4F9FC !important; padding: 0.5rem !important; }
@@ -44,8 +55,20 @@ st.markdown("""
         .brand-footer { text-align: center; color: #95A5A6; font-size: 12px; margin-top: 50px; border-top: 1px solid #E2E8F0; padding-top: 15px; }
         button[title="View fullscreen"] { display: none !important; }
         [data-testid="stImageHoverButtons"] { display: none !important; visibility: hidden !important; }
-        div[role="dialog"] { width: 95vw !important; max-width: 1350px !important; padding: 1rem !important; border-radius: 8px !important; }
-        div[data-testid="stDialog"] { width: 95vw !important; max-width: 1350px !important; gap: 0.5rem !important; }
+
+        /* Расширяем модальное окно на 95% ширины экрана */
+        div[role="dialog"] {
+            width: 95vw !important;
+            max-width: 1350px !important;
+            padding: 1rem !important;
+            border-radius: 8px !important;
+        }
+        div[data-testid="stDialog"] {
+            width: 95vw !important;
+            max-width: 1350px !important;
+            gap: 0.5rem !important;
+        }
+
         .stRadio { margin-bottom: -10px !important; }
         .stSlider { margin-bottom: -10px !important; }
         hr { margin: 0.4em 0 !important; }
@@ -60,7 +83,18 @@ def mask_to_base64(mask_array):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-# --- ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
+# --- ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ПЕРЕКЛЮЧЕНИЯ СТРАНИЦ ---
+if "show_markup" not in st.session_state:
+    st.session_state.show_markup = False
+
+# --- ШАПКА ПЛАТФОРМЫ ---
+st.markdown('<div class="brand-header">НОРНИКЕЛЬ</div>', unsafe_allow_html=True)
+st.markdown('<div class="brand-subtitle">Цифровая лаборатория обогащения | Автоклассификация руд</div>',
+            unsafe_allow_html=True)
+st.divider()
+
+
+# --- 🖍️ ОКНО ЭКСПЕРТНОЙ РАЗМЕТКИ (ACTIVE LEARNING) ---
 @st.dialog("Режим экспертной разметки (Обучение с подкреплением)")
 def show_markup_modal(saved_img_path, original_filename, original_verdict):
     modal_left, modal_right = st.columns([1.1, 2.9])
@@ -68,6 +102,8 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
         st.markdown("<div style='font-weight: 600; font-size: 14px;'>Инструмент рисования:</div>",
                     unsafe_allow_html=True)
         drawing_mode = st.radio("Инструмент:", ("Кисть", "Полигон"), horizontal=True, label_visibility="collapsed")
+
+        # Исправленный размер кисти от 1 до 10
         st.markdown("<div style='font-weight: 600; font-size: 14px; margin-top: 5px;'>Размер кисти:</div>",
                     unsafe_allow_html=True)
         brush_size = st.slider("Размер кисти:", min_value=1, max_value=10, value=3, label_visibility="collapsed")
@@ -103,24 +139,30 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
         try:
             bg_img = Image.open(saved_img_path).convert("RGB")
             orig_w, orig_h = bg_img.size
-            canvas_width = 750
+
+            base_canvas_width = 750
+
+            canvas_width = base_canvas_width
             w_percent = canvas_width / float(orig_w)
             canvas_height = int(orig_h * w_percent)
-            # ВАЖНО: передаём PIL.Image, НЕ numpy — так canvas не падает
-            bg_img_resized = bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+
+            bg_img_resized = np.array(
+                bg_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+            )
+
             canvas_result = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=brush_size,
                 stroke_color=stroke_color,
-                background_image=bg_img_resized,   # PIL.Image
+                background_image=bg_img_resized,
                 update_streamlit=True,
                 height=canvas_height,
                 width=canvas_width,
                 drawing_mode=actual_mode,
-                key="modal_expert_canvas",
+                key=f"modal_expert_canvas_{original_filename}",
             )
         except Exception as e:
-            st.error(f"Ошибка загрузки холста: {e}")
+            st.error(f"Ошибка инициализации рабочей области: {e}")
             canvas_result = None
 
     # --- СОХРАНЕНИЕ ---
@@ -131,11 +173,16 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             mask_thin = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
             mask_talc = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
 
-            green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (drawn_rgba[:, :, 3] > 0)
+            green_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 100) & (drawn_rgba[:, :, 2] < 100) & (
+                    drawn_rgba[:, :, 3] > 0)
             mask_ordinary[green_pixels] = 255
-            red_pixels = (drawn_rgba[:, :, 0] > 150) & (drawn_rgba[:, :, 1] < 100) & (drawn_rgba[:, :, 2] < 100) & (drawn_rgba[:, :, 3] > 0)
+
+            red_pixels = (drawn_rgba[:, :, 0] > 150) & (drawn_rgba[:, :, 1] < 100) & (drawn_rgba[:, :, 2] < 100) & (
+                    drawn_rgba[:, :, 3] > 0)
             mask_thin[red_pixels] = 255
-            blue_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 50) & (drawn_rgba[:, :, 2] > 150) & (drawn_rgba[:, :, 3] > 0)
+
+            blue_pixels = (drawn_rgba[:, :, 0] < 100) & (drawn_rgba[:, :, 1] > 50) & (drawn_rgba[:, :, 2] > 150) & (
+                    drawn_rgba[:, :, 3] > 0)
             mask_talc[blue_pixels] = 255
 
             mask_ordinary_orig = cv2.resize(mask_ordinary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -167,23 +214,18 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             st.warning("Нанесите разметку перед отправкой.")
 
 
-# --- ГЛАВНАЯ СТРАНИЦА ---
-st.markdown('<div class="brand-header">НОРНИКЕЛЬ</div>', unsafe_allow_html=True)
-st.markdown('<div class="brand-subtitle">Цифровая лаборатория обогащения | Автоклассификация руд</div>',
-            unsafe_allow_html=True)
-st.divider()
-
+# --- РЕЖИМ 2: СТАНДАРТНЫЙ ДАШБОРД АНАЛИТИКИ ШЛИФА ---
 uploaded_file = st.file_uploader(
     "Выберите микрофотографию рудного шлифа для автоматической сегментации фаз",
     type=["tiff", "tif", "png", "jpg", "jpeg"]
 )
 
 if uploaded_file is not None:
-    temp_path = os.path.join(tempfile.gettempdir(), "temp_core_analysis.jpg")
+    temp_path = "temp_core_analysis.jpg"
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    with st.spinner("Интеллектуальный анализ структуры шлифа..."):
+    with st.spinner("Интеллектуальный анализ структуры шлифа OpenCV..."):
         result = analyzer.analyze(temp_path)
         result["original_image_path"] = temp_path
         if "metrics" in result:
@@ -193,7 +235,7 @@ if uploaded_file is not None:
     verdict = result["verdict"]
     if verdict == "Оталькованная":
         status_badge = '<span style="color: #0080C8; font-weight: bold;">🔵 Оталькованная руда</span>'
-    elif verdict == "Рядовая":
+    elif verdict == "Рядовой":
         status_badge = '<span style="color: #28A745; font-weight: bold;">🟢 Рядовая руда</span>'
     else:
         status_badge = '<span style="color: #DC3545; font-weight: bold;">🔴 Труднообогатимая руда</span>'
@@ -311,4 +353,5 @@ if uploaded_file is not None:
                     st.download_button("🗺️ Выгрузить GeoJSON", f, file_name="nornickel_gis_contours.geojson",
                                        mime="application/geo+json", use_container_width=True)
 else:
-    st.info("Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
+    st.info(
+        "Системное уведомление: Для начала работы загрузите исходное панорамное изображение (.tiff, .png, .jpg) в модуль обработки.")
