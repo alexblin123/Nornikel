@@ -1,7 +1,8 @@
 """
 analyzer.py — Анализатор геологических шлифов.
 Классификация сорта: CNN (ResNet18, F1 92.4%).
-Сегментация маски (тальк/тонкие/обычные): OpenCV.
+Детекция талька: U-Net (Dice 0.723) + экспертная разметка (OpenCV).
+Сегментация срастаний: OpenCV.
 Классы: Оталькованная / Рядовая / Труднообогатимая.
 """
 import cv2
@@ -20,12 +21,15 @@ TALC_THRESHOLD = 10.0
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CNN_PATH = os.path.join(_HERE, "cnn_model.pth")
+TALC_UNET_PATH = os.path.join(_HERE, "talc_unet.pth")
+TALC_IMG_SIZE = 512  # ДОЛЖНО совпадать с обучением U-Net!
+
 CLASS_NAMES = ["Рядовая", "Труднообогатимая"]  # 0, 1 — как при обучении!
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 COLOR_ORDINARY = (0, 255, 0)  # зелёный — обычные срастания
-COLOR_THIN = (0, 0, 255)  # красный — тонкие срастания
-COLOR_TALC = (255, 0, 0)  # синий — тальк
+COLOR_THIN = (0, 0, 255)      # красный — тонкие срастания
+COLOR_TALC = (255, 0, 0)      # синий — тальк
 OVERLAY_ALPHA = 0.45
 
 _CNN_TF = transforms.Compose([
@@ -81,6 +85,36 @@ def detect_talc_blue(image):
     return mask, float((mask > 0).sum()) / total * 100, True
 
 
+# ---------- U-NET ДЕТЕКЦИЯ ТАЛЬКА (без разметки) ----------
+def _conv_block(ci, co):
+    return nn.Sequential(
+        nn.Conv2d(ci, co, 3, padding=1), nn.BatchNorm2d(co), nn.ReLU(inplace=True),
+        nn.Conv2d(co, co, 3, padding=1), nn.BatchNorm2d(co), nn.ReLU(inplace=True))
+
+
+class TalcUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.d1 = _conv_block(3, 32);   self.d2 = _conv_block(32, 64)
+        self.d3 = _conv_block(64, 128); self.d4 = _conv_block(128, 256)
+        self.pool = nn.MaxPool2d(2);    self.bott = _conv_block(256, 512)
+        self.up4 = nn.ConvTranspose2d(512, 256, 2, 2); self.u4 = _conv_block(512, 256)
+        self.up3 = nn.ConvTranspose2d(256, 128, 2, 2); self.u3 = _conv_block(256, 128)
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, 2);  self.u2 = _conv_block(128, 64)
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, 2);   self.u1 = _conv_block(64, 32)
+        self.out = nn.Conv2d(32, 1, 1)
+
+    def forward(self, x):
+        c1 = self.d1(x); c2 = self.d2(self.pool(c1))
+        c3 = self.d3(self.pool(c2)); c4 = self.d4(self.pool(c3))
+        b = self.bott(self.pool(c4))
+        x = self.u4(torch.cat([self.up4(b), c4], 1))
+        x = self.u3(torch.cat([self.up3(x), c3], 1))
+        x = self.u2(torch.cat([self.up2(x), c2], 1))
+        x = self.u1(torch.cat([self.up1(x), c1], 1))
+        return self.out(x)
+
+
 # ---------- СУЛЬФИДЫ + МАСКИ ----------
 def extract_features_and_masks(image, exclude_mask=None):
     h, w = image.shape[:2]
@@ -92,7 +126,6 @@ def extract_features_and_masks(image, exclude_mask=None):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     th = cv2.morphologyEx(th, cv2.MORPH_OPEN, k)
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k)
-
     n, lbl, stats, _ = cv2.connectedComponentsWithStats(th, 8)
     ordinary = np.zeros((h, w), np.uint8)
     thin = np.zeros((h, w), np.uint8)
@@ -108,15 +141,14 @@ def extract_features_and_masks(image, exclude_mask=None):
         c = max(cnts, key=cv2.contourArea)
         ha = cv2.contourArea(cv2.convexHull(c))
         s = cv2.contourArea(c) / ha if ha > 0 else 0
-        sol.append(s);
+        sol.append(s)
         areas.append(a)
         if s < SOLIDITY_THRESHOLD:
-            thin[lbl == i] = 255;
+            thin[lbl == i] = 255
             thin_a += a
         else:
-            ordinary[lbl == i] = 255;
+            ordinary[lbl == i] = 255
             ord_a += a
-
     tot = thin_a + ord_a
     features = {
         "thin%": thin_a / tot * 100 if tot > 0 else 0,
@@ -141,6 +173,12 @@ class ShlifAnalyzer:
             self.model.fc = nn.Linear(self.model.fc.in_features, len(CLASS_NAMES))
             self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
             self.model.to(DEVICE).eval()
+        # U-Net для детекции талька без разметки
+        self.talc_model = None
+        if os.path.exists(TALC_UNET_PATH):
+            self.talc_model = TalcUNet()
+            self.talc_model.load_state_dict(torch.load(TALC_UNET_PATH, map_location=DEVICE))
+            self.talc_model.to(DEVICE).eval()
 
     def _classify_cnn(self, image_bgr):
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -152,6 +190,20 @@ class ShlifAnalyzer:
                      for i in range(len(CLASS_NAMES))}
         return CLASS_NAMES[idx], prob_dict
 
+    def _detect_talc_unet(self, image_bgr):
+        """U-Net сегментация талька. Возвращает (маска, %, heatmap 0..1)."""
+        h, w = image_bgr.shape[:2]
+        inp = cv2.resize(image_bgr, (TALC_IMG_SIZE, TALC_IMG_SIZE))
+        inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.
+        inp = (inp - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+        t = torch.from_numpy(inp.transpose(2, 0, 1)).float().unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            prob = torch.sigmoid(self.talc_model(t))[0, 0].cpu().numpy()
+        heatmap = cv2.resize(prob, (w, h))
+        mask = (heatmap > 0.5).astype(np.uint8) * 255
+        pct = float((mask > 0).sum()) / (h * w) * 100
+        return mask, pct, heatmap
+
     def analyze(self, image_path):
         try:
             image = imread_unicode(image_path)
@@ -161,18 +213,29 @@ class ShlifAnalyzer:
         image = resize_if_large(image, 1500)
         h, w = image.shape[:2]
 
-        # 1) тальк по синей разметке
+        # 1) тальк по синей разметке (эксперт)
         talc_mask, talc_pct, has_marking = detect_talc_blue(image)
+
+        # 1b) если разметки нет — U-Net ищет тальк сам
+        talc_heatmap = None
+        talc_source = "не обнаружен"
+        if has_marking:
+            talc_source = "экспертная разметка"
+        elif self.talc_model is not None:
+            u_mask, u_pct, talc_heatmap = self._detect_talc_unet(image)
+            talc_mask, talc_pct = u_mask, u_pct
+            talc_source = "нейросеть U-Net"
 
         # 2) маска срастаний (исключая тальк)
         feats, masks = extract_features_and_masks(image, exclude_mask=talc_mask)
 
         # 3) классификация
         probs = {}
-        if has_marking and talc_pct > TALC_THRESHOLD:
+        talc_detected = has_marking or (self.talc_model is not None)
+        if talc_detected and talc_pct > TALC_THRESHOLD:
             verdict = "Оталькованная"
-            conclusion = (f"Руда ОТАЛЬКОВАННАЯ: обнаружена размеченная область "
-                          f"талька — {talc_pct:.1f}% площади (порог {TALC_THRESHOLD:.0f}%).")
+            conclusion = (f"Руда ОТАЛЬКОВАННАЯ: обнаружен тальк — {talc_pct:.1f}% "
+                          f"площади (порог {TALC_THRESHOLD:.0f}%). Источник: {talc_source}.")
         elif self.model is not None:
             verdict, probs = self._classify_cnn(image)
             conf = max(probs.values())
@@ -191,6 +254,7 @@ class ShlifAnalyzer:
             "confidence": round(max(probs.values()), 3) if probs else None,
             "probabilities": probs,
             "talc_percent": round(talc_pct, 2),
+            "talc_source": talc_source,
             "has_talc_marking": has_marking,
             "sulfide_percent": round(masks["sulfide%"], 2),
             "thin_percent_of_sulfides": round(feats["thin%"], 2),
@@ -198,8 +262,11 @@ class ShlifAnalyzer:
             "mean_inclusion_area": round(feats["mean_area"], 1),
             "image_size": f"{w}x{h}",
         }
-        return {"verdict": verdict, "conclusion": conclusion,
-                "metrics": metrics, "overlay_image": overlay}
+        result = {"verdict": verdict, "conclusion": conclusion,
+                  "metrics": metrics, "overlay_image": overlay}
+        if talc_heatmap is not None:
+            result["talc_heatmap"] = talc_heatmap
+        return result
 
     @staticmethod
     def _overlay(image, talc, ordinary, thin):
@@ -216,9 +283,10 @@ class ShlifAnalyzer:
 
 if __name__ == "__main__":
     import sys
-
     path = sys.argv[1] if len(sys.argv) > 1 else "test.jpg"
     a = ShlifAnalyzer()
+    print("CNN загружен:", a.model is not None)
+    print("U-Net загружен:", a.talc_model is not None)
     r = a.analyze(path)
     print("ВЕРДИКТ:", r["verdict"])
     print("ЗАКЛЮЧЕНИЕ:", r["conclusion"])

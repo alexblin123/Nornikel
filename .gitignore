@@ -15,3 +15,4 @@ temp_*.jpg
 nornickel_metrics.csv
 nornickel_passport.pdf
 nornickel_gis_contours.geojson
+overlay_result.png
