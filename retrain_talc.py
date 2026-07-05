@@ -116,7 +116,7 @@ def main():
 
     # 1. Загружаем ТЕКУЩИЕ веса (transfer learning, НЕ с нуля)
     model = UNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.ckpt, map_location=DEVICE))
+    model.load_state_dict(torch.load(args.ckpt, map_location=DEVICE, weights_only=True))
     print(f"Загружены текущие веса: {args.ckpt}")
 
     # 2. Baseline Dice ДО дообучения
