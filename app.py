@@ -210,6 +210,12 @@ def show_markup_modal(saved_img_path, original_filename, original_verdict):
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_thin_{original_filename}.png"), mask_thin_orig)
             cv2.imwrite(os.path.join("active_learning_dataset", f"mask_talc_{original_filename}.png"), mask_talc_orig)
             st.success("✅ Экспорт завершен! Пакет сохранен в папку `active_learning_dataset/`.")
+
+            # Сохраняем исходное фото (нужно для дообучения U-Net)            
+            orig_for_train = cv2.imread(saved_img_path)            
+            if orig_for_train is not None:            
+                cv2.imwrite(os.path.join("active_learning_dataset", f"image_{original_filename}.png"), orig_for_train)
+
         else:
             st.warning("Нанесите разметку перед отправкой.")
 
